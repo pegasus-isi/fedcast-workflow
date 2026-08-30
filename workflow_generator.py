@@ -660,7 +660,6 @@ class FedCastWorkflow:
             Job("mct_verify", _id=f"verify_{tag}", node_label=f"verify_{tag}")
             .add_args(
                 "--method", method,
-                "--interval", str(interval) if interval else "",
                 "--forecasts", forecasts,
                 "--benchmark", self.benchmark_file,
                 "--rain-threshold", str(self.args.rain_threshold),
@@ -670,6 +669,8 @@ class FedCastWorkflow:
             .add_outputs(metrics, stage_out=True, register_replica=False)
             .add_pegasus_profiles(label=tag)
         )
+        if interval:
+            verify_job.add_args("--interval", str(interval))
         for site in self.sites:
             verify_job.add_args(
                 "--client",

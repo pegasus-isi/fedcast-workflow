@@ -105,7 +105,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compute the MCT metric suite for one (method, L)")
     parser.add_argument("--method", required=True)
-    parser.add_argument("--interval", default="")
+    # nargs="?" tolerates a bare `--interval` flag: Pegasus drops
+    # empty-string arguments when serializing job args.
+    parser.add_argument("--interval", nargs="?", const="", default="")
     parser.add_argument("--forecasts", required=True)
     parser.add_argument("--benchmark", required=True)  # provenance input
     parser.add_argument("--client", action="append", default=[])
