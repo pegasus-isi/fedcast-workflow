@@ -13,6 +13,11 @@ ROOT=$(pwd)
 WORK=manual_run
 mkdir -p "$WORK"
 
+# PILOT-ONLY model shrink so DGMR GAN training fits on CPU / low-memory
+# hosts. Reproduction runs use the 288 / 2 defaults on GPU nodes.
+export FEDCAST_MODEL_SIZE=128
+export FEDCAST_BATCH_SIZE=1
+
 # Phase runners: apptainer exec if the images are present.
 if [ -f "$ROOT/Apptainer/FedCast_data.sif" ]; then
     PY_DATA="apptainer exec --bind $ROOT $ROOT/Apptainer/FedCast_data.sif python3"

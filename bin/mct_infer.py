@@ -22,6 +22,7 @@ Output npz:
 import argparse
 import csv
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,8 @@ EVENT_PAD_S = 1800  # pad event windows by 30 min (documented rule)
 # All methods are evaluated on the same center-cropped 288x288 grid
 # (= 9 * 32): DGMR requires spatial dims divisible by 32, and comparing
 # methods on different grids would bias the candidate pool.
-MODEL_SIZE = 288
+# FEDCAST_MODEL_SIZE is a PILOT-ONLY override for low-memory smoke tests.
+MODEL_SIZE = int(os.environ.get("FEDCAST_MODEL_SIZE", "288"))
 
 
 def center_crop(arr, size=MODEL_SIZE):

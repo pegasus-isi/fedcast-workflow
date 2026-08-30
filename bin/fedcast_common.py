@@ -6,6 +6,7 @@ the job's cwd. Keep it dependency-light: numpy + torch + lightning + dgmr.
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 
 import numpy as np
@@ -15,13 +16,21 @@ logger = logging.getLogger(__name__)
 INPUT_FRAMES = 4
 FORECAST_STEPS = 12
 GRID_LAMBDA = 20.0  # grid-cell regularizer weight (paper Sec. IV-C)
-BATCH_SIZE = 2      # conservative default for ~300x300 fields
 
 # DGMR's latent/conditioning stacks require spatial dims divisible by 32;
 # 300 is not, so we center-crop the 300x300 windows to 288x288 (= 9 * 32),
 # the largest fitting size. Documented deviation — how the paper fed
 # 300x300 fields into DGMR is an open author question (SPEC Sec. 6).
-MODEL_SIZE = 288
+#
+# FEDCAST_MODEL_SIZE / FEDCAST_BATCH_SIZE are PILOT-ONLY overrides for
+# CPU/low-memory smoke tests (e.g. 128 / 1). Reproduction runs must use
+# the 288 / 2 defaults.
+MODEL_SIZE = int(os.environ.get("FEDCAST_MODEL_SIZE", "288"))
+BATCH_SIZE = int(os.environ.get("FEDCAST_BATCH_SIZE", "2"))
+if MODEL_SIZE != 288 or BATCH_SIZE != 2:
+    logger.warning("PILOT overrides active: MODEL_SIZE=%d BATCH_SIZE=%d — "
+                   "not valid for reproduction runs",
+                   MODEL_SIZE, BATCH_SIZE)
 
 
 def center_crop(arr, size=MODEL_SIZE):
