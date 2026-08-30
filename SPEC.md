@@ -334,6 +334,14 @@ framing.
     all inits in the window?) is unspecified; this changes per-event sample sizes.
     *Proposal:* all valid 16-frame sequences whose target window intersects the
     event window, documented as our rule.
+11. **300×300 fields vs. DGMR's 32-divisibility requirement.** The openclimatefix
+    DGMR requires spatial dims divisible by 32 (its latent/conditioning stacks
+    downsample by 32); 300×300 is not, and feeding it fails with a ConvGRU shape
+    mismatch (confirmed empirically 2026-08-30). How did the paper feed 300×300
+    MRMS windows into DGMR — padding to 320, resizing/cropping to 256 or 288, or
+    a modified architecture? *Our documented rule:* center-crop to 288×288
+    (= 9×32) at the model boundary, applied identically to every method
+    (including STEPS) so the evaluation grid stays uniform.
 
 ---
 

@@ -15,7 +15,21 @@ logger = logging.getLogger(__name__)
 INPUT_FRAMES = 4
 FORECAST_STEPS = 12
 GRID_LAMBDA = 20.0  # grid-cell regularizer weight (paper Sec. IV-C)
-BATCH_SIZE = 2      # conservative default for 300x300 fields
+BATCH_SIZE = 2      # conservative default for ~300x300 fields
+
+# DGMR's latent/conditioning stacks require spatial dims divisible by 32;
+# 300 is not, so we center-crop the 300x300 windows to 288x288 (= 9 * 32),
+# the largest fitting size. Documented deviation — how the paper fed
+# 300x300 fields into DGMR is an open author question (SPEC Sec. 6).
+MODEL_SIZE = 288
+
+
+def center_crop(arr, size=MODEL_SIZE):
+    """Center-crop the last two (H, W) dims to size x size."""
+    h, w = arr.shape[-2], arr.shape[-1]
+    top = max(0, (h - size) // 2)
+    left = max(0, (w - size) // 2)
+    return arr[..., top:top + size, left:left + size]
 
 
 def parse_client(spec):
@@ -57,6 +71,7 @@ def load_client_data(client, t_start, limit=None):
             arr = arr[:limit]
         if arr.shape[0] == 0:
             return None, None
+        arr = center_crop(arr)  # DGMR needs dims divisible by 32
         # (N, T, H, W) -> inputs (N, 4, 1, H, W), targets (N, 12, 1, H, W)
         x = torch.from_numpy(arr[:, :INPUT_FRAMES])[:, :, None]
         y = torch.from_numpy(arr[:, INPUT_FRAMES:])[:, :, None]
@@ -79,7 +94,7 @@ def build_model(seed):
 
     torch.manual_seed(seed)
     np.random.seed(seed % (2 ** 32))
-    return DGMR(forecast_steps=FORECAST_STEPS)
+    return DGMR(forecast_steps=FORECAST_STEPS, output_shape=MODEL_SIZE)
 
 
 def make_loader(x, y):

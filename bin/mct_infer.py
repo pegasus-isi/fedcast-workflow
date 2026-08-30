@@ -39,6 +39,19 @@ FORECAST_STEPS = 12
 CADENCE_S = 120
 EVENT_PAD_S = 1800  # pad event windows by 30 min (documented rule)
 
+# All methods are evaluated on the same center-cropped 288x288 grid
+# (= 9 * 32): DGMR requires spatial dims divisible by 32, and comparing
+# methods on different grids would bias the candidate pool.
+MODEL_SIZE = 288
+
+
+def center_crop(arr, size=MODEL_SIZE):
+    """Center-crop the last two (H, W) dims to size x size."""
+    h, w = arr.shape[-2], arr.shape[-1]
+    top = max(0, (h - size) // 2)
+    left = max(0, (w - size) // 2)
+    return arr[..., top:top + size, left:left + size]
+
 
 def parse_client(spec):
     name, seq_lfn, manifest_lfn = spec.split(":")
@@ -176,7 +189,8 @@ def main():
         import torch
         from dgmr import DGMR
 
-        model = DGMR(forecast_steps=FORECAST_STEPS)
+        model = DGMR(forecast_steps=FORECAST_STEPS,
+                     output_shape=MODEL_SIZE)
         payload = torch.load(args.checkpoint, map_location="cpu")
         model.load_state_dict(payload["state_dict"])
         model.eval()
@@ -186,7 +200,7 @@ def main():
     forecasts, observations, inputs = [], [], []
     exec_times, event_ids, sites, start_epochs = [], [], [], []
     for inst in instances:
-        seq = inst["sequence"].astype(np.float32)
+        seq = center_crop(inst["sequence"].astype(np.float32))
         precip_in, obs = seq[:INPUT_FRAMES], seq[INPUT_FRAMES:]
         t0 = time.time()
         try:
