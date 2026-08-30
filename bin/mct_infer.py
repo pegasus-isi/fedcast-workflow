@@ -170,6 +170,11 @@ def main():
                         help="SITE:sequences_lfn:manifest_lfn (repeatable)")
     parser.add_argument("--ensemble-size", type=int, required=True)
     parser.add_argument("--max-instances-per-event", type=int, default=2)
+    parser.add_argument("--fallback-test-instances", type=int, default=0,
+                        help="PILOT ONLY: if no benchmark event matches a "
+                             "test sequence, evaluate up to N test "
+                             "sequences per site instead (event_id="
+                             "'fallback'). Never for reproduction runs.")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -180,6 +185,23 @@ def main():
     instances = match_instances(events, clients,
                                 args.max_instances_per_event)
     logger.info("Matched %d forecast instances", len(instances))
+    if not instances and args.fallback_test_instances > 0:
+        logger.warning("PILOT FALLBACK: no event matched — using up to %d "
+                       "test sequences per site (not valid for "
+                       "reproduction runs)", args.fallback_test_instances)
+        for c in clients:
+            with np.load(c["sequences"]) as data:
+                mask = data["split"] == 2
+                seqs = data["sequences"][mask]
+                starts = data["start_epoch"][mask]
+            for i in range(min(args.fallback_test_instances,
+                               seqs.shape[0])):
+                instances.append({
+                    "event_id": "fallback", "site": c["name"],
+                    "sequence": seqs[i],
+                    "start_epoch": float(starts[i]),
+                })
+        logger.info("Fallback instances: %d", len(instances))
     if not instances:
         logger.error("No benchmark events matched any test sequence")
         np.savez_compressed(args.output,

@@ -128,6 +128,7 @@ echo "== Phase D: inference + verification =="
 # shellcheck disable=SC2086
 $PY_EVAL "$BIN/mct_infer.py" --method steps $CLIENTS \
     --benchmark benchmark_events.csv --ensemble-size 20 \
+    --fallback-test-instances 2 \
     --output steps_forecasts.npz
 # shellcheck disable=SC2086
 $PY_EVAL "$BIN/mct_verify.py" --method steps --interval "" \
@@ -139,6 +140,7 @@ for M in cen fed; do
     $PY_EVAL "$BIN/mct_infer.py" --method "$M" $CLIENTS \
         --checkpoint "${M}_L1_best.ckpt" \
         --benchmark benchmark_events.csv --ensemble-size 6 \
+        --fallback-test-instances 2 \
         --output "${M}_L1_forecasts.npz"
     # shellcheck disable=SC2086
     $PY_EVAL "$BIN/mct_verify.py" --method "$M" --interval 1 \
