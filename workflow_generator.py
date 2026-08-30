@@ -209,20 +209,38 @@ class FedCastWorkflow:
                 ),
                 image_site="local",
             )
+            if name in ("train", "eval"):
+                # Expose host GPUs inside Apptainer (harmless warning on
+                # CPU-only nodes).
+                containers[name].add_pegasus_profile(
+                    container_arguments="--nv")
         self.tc.add_containers(*containers.values())
 
         for tool_name, cfg in TOOL_CONFIGS.items():
+            memory = cfg["memory"]
+            cores = cfg.get("cores", 1)
+            gpus = cfg.get("gpus")
+            if self.args.test:
+                # Pilot mode: keep GPU requests (the pool has GPU workers)
+                # but scale memory to fit ~15 GB machines; the FEDCAST_*
+                # env shrinks the model to match (fedcast_common.py) and
+                # flows into FL-round SubWorkflows via the shared
+                # transformation catalog.
+                memory = "8 GB" if (gpus or cfg["container"] == "train") \
+                    else "2 GB"
+                cores = min(cores, 2)
             tx = Transformation(
                 tool_name,
                 site=exec_site_name,
                 pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
                 is_stageable=True,
                 container=containers[cfg["container"]],
-            ).add_pegasus_profile(
-                memory=cfg["memory"], cores=cfg.get("cores", 1)
-            )
-            if cfg.get("gpus"):
-                tx.add_condor_profile(request_gpus=str(cfg["gpus"]))
+            ).add_pegasus_profile(memory=memory, cores=cores)
+            if gpus:
+                tx.add_condor_profile(request_gpus=str(gpus))
+            if self.args.test and cfg["container"] in ("train", "eval"):
+                tx.add_env(FEDCAST_MODEL_SIZE="128",
+                           FEDCAST_BATCH_SIZE="1")
             self.tc.add_transformations(tx)
 
     # ------------------------------------------------------------------
@@ -457,6 +475,9 @@ class FedCastWorkflow:
                 )
             for arg in (extra_args or []):
                 job.add_args(*arg)
+            if self.args.limit_train_sequences:
+                job.add_args("--limit-train-sequences",
+                             str(self.args.limit_train_sequences))
             if prev_state is not None:
                 job.add_args("--state-in", prev_state)
                 job.add_inputs(prev_state)
@@ -621,6 +642,9 @@ class FedCastWorkflow:
         if ckpt is not None:
             infer_job.add_args("--checkpoint", ckpt)
             infer_job.add_inputs(ckpt)
+        if self.args.fallback_test_instances:
+            infer_job.add_args("--fallback-test-instances",
+                               str(self.args.fallback_test_instances))
         self.wf.add_jobs(infer_job)
 
         metrics = File(f"{tag}_metrics.csv")
@@ -794,6 +818,12 @@ Examples:
     parser.add_argument("--frame-stride", type=int, default=1,
                         help="Keep every Nth 2-min MRMS frame (default: 1 = "
                              "full cadence; >1 subsamples for pilot runs)")
+    parser.add_argument("--limit-train-sequences", type=int, default=None,
+                        help="PILOT ONLY: cap train/val sequences per "
+                             "client in training jobs")
+    parser.add_argument("--fallback-test-instances", type=int, default=0,
+                        help="PILOT ONLY: mct_infer falls back to N test "
+                             "sequences per site when no event matches")
     parser.add_argument("--max-concurrent-jobs", type=int, default=20,
                         help="DAGMan job throttle (default: 20)")
 
@@ -812,7 +842,9 @@ Examples:
         args.segment_size = 1
         args.validate_every = 1
         args.max_events_per_site = 2
-        args.frame_stride = 5
+        args.frame_stride = 15
+        args.limit_train_sequences = 4
+        args.fallback_test_instances = 2
         logger.info("PILOT MODE: %s, %d month(s), %d round(s)",
                     args.sites, args.months, args.rounds)
 
