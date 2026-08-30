@@ -844,6 +844,9 @@ Examples:
 
     if args.test:
         args.sites = ["KTLX", "KENX"]
+        # 2024-01 is a month verified to contain in-window benchmark
+        # events for these sites (winter months often have none).
+        args.start_month = "2024-01"
         args.months = 1
         args.intervals = [1]
         args.rounds = 2
