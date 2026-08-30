@@ -6,6 +6,11 @@ From: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
     Purpose Fed-Cast evaluation phase: MCT inference, verification, TOPSIS
 
 %post
+    # pysteps compiles C extensions (openmp) at install time.
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
     pip install --no-cache-dir \
         "numpy<2" \
         pysteps \
