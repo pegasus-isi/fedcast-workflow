@@ -19,9 +19,13 @@ Phase A  fetch_crop_mrms   one job per (domain, month): MRMS PrecipRate from
                            rain filter, frozen 80/10/10 split + manifest
 Phase B  fetch_events      WPC MPD, LSR, Storm Events (best-effort each)
          build_benchmark   frozen, balanced event set B
-Phase C  train_dgmr        per interval L: centralized DGMR and federated
-                           DGMR (synchronous FedAvg, 7 clients, uniform
-                           weights), as chains of checkpointed segment jobs
+Phase C  train_dgmr        centralized DGMR per interval L, as chains of
+                           checkpointed segment jobs
+         fl_* + SubWorkflows  federated DGMR per interval L: fl_init, then
+                           ONE SubWorkflow PER FL ROUND (fl_round.py) —
+                           fl_train_client x N in parallel -> fl_aggregate
+                           (FedAvg uniform/quadratic) -> fl_validate
+                           (chained best-checkpoint tracking)
 Phase D  mct_infer         DGMR K=6 ensembles / STEPS 20-member ensemble
          mct_verify        Table-I metric suite per lead time, lead-averaged
          mct_topsis        objective-side-balanced TOPSIS per candidate pool

@@ -48,10 +48,14 @@ Phase B — Event benchmark construction (once)
 
 Phase C — Training (per L; GPU jobs)
   C1. train_centralized(L)          # DGMR on pooled 7-site data, 100 epochs,
-                                    # validate every 5, keep lowest generator val-loss ckpt
-  C2. train_federated(L)            # Flower FedAvg simulation: 7 clients, uniform weights,
+                                    # validate every 5, keep lowest generator val-loss ckpt;
+                                    # chain of checkpointed segment jobs (10 epochs/job)
+  C2. train_federated(L)            # synchronous FedAvg: 7 clients, uniform weights,
                                     # 100 rounds × 1 local epoch, all clients per round,
-                                    # validate every 5 rounds, same checkpoint rule
+                                    # validate every 5 rounds, same checkpoint rule;
+                                    # ONE SubWorkflow PER ROUND (fl_round.py): per-client
+                                    # fan-out → fl_aggregate → fl_validate, chained via
+                                    # the global-model file
   (STEPS requires no training — it runs at inference time in Phase D)
 
 Phase D — Evaluation via MCT (per method × L × event)
@@ -299,14 +303,19 @@ framing.
    benchmark set B" (paper Fig. 3) doesn't specify balancing dimensions (per site?
    per season? per source?) or the event count. *Proposal:* balance per site ×
    source, cap events per site, freeze with a fixed seed.
-6. **Federated training inside Pegasus.** Options: (a) one monolithic GPU job per
-   (paradigm, L) running the full Flower simulation internally — simple, matches the
-   paper's emulation, but a 100-round job is long-running and coarse-grained for
-   retries; (b) checkpointed segments (e.g., 10 rounds/job chained via Pegasus
-   dependencies) — restartable, more Pegasus-idiomatic; (c) true multi-node
-   client/server jobs — closest to "federated" in spirit but adds networking
-   complexity Pegasus/HTCondor doesn't natively love. *Recommendation:* (b) for the
-   main runs, with (a) as the initial bring-up mode.
+6. **Federated training inside Pegasus.** ~~Options: (a) one monolithic GPU job per
+   (paradigm, L); (b) checkpointed segments; (c) per-round SubWorkflows with
+   per-client jobs.~~ **DECIDED (2026-08-30): per-round SubWorkflows (c).** Each FL
+   round is a sub-DAG (`fl_round.py`): fl_train_client × 7 in parallel →
+   fl_aggregate (FedAvg) → fl_validate (validation rounds chain history +
+   best-so-far; final round emits the best checkpoint). Rounds are chained through
+   the global-model file. Centralized training keeps checkpointed segment chains
+   (b) — it has no client structure to express. Trade-offs accepted: ~100 sub-DAG
+   plannings per (method, L) and per-round staging of the global model and client
+   sequence files; gained: per-client job placement (true multi-site federation
+   becomes possible), per-round retry granularity, and per-round visibility.
+   Follow-up: verify parent↔sub-workflow file-flow semantics (stage_out /
+   --output-sites) on the cluster at pilot scale before full runs.
 7. **GPU budget.** 6 intervals × (centralized + federated) + E2.1 (6) + E2.2 (2 ρ ×
    6) ≈ 30 DGMR training runs of 100 epochs/rounds each on ~4.5K–33K sequences.
    Need an estimate of hours-per-run on available GPUs (Chameleon A100? FABRIC?)

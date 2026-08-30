@@ -35,6 +35,13 @@ from pathlib import Path
 
 from Pegasus.api import *
 
+from fl_round import (
+    COMMON_LFN,
+    generate_round_workflow,
+    init_file_names,
+    round_file_names,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -74,6 +81,12 @@ TOOL_CONFIGS = {
     "fetch_events":         {"memory": "2 GB",  "cores": 1, "container": "data"},
     "build_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data"},
     "train_dgmr":           {"memory": "32 GB", "cores": 8, "container": "train",
+                             "gpus": 1},
+    "fl_init":              {"memory": "8 GB",  "cores": 2, "container": "train"},
+    "fl_train_client":      {"memory": "32 GB", "cores": 8, "container": "train",
+                             "gpus": 1},
+    "fl_aggregate":         {"memory": "16 GB", "cores": 2, "container": "train"},
+    "fl_validate":          {"memory": "32 GB", "cores": 8, "container": "train",
                              "gpus": 1},
     "mct_infer":            {"memory": "16 GB", "cores": 4, "container": "eval",
                              "gpus": 1},
@@ -128,6 +141,12 @@ class FedCastWorkflow:
         self.benchmark_file = None
         # Metric CSVs collected for TOPSIS pools: {method: {L: File}}
         self.metric_files = {}
+        # FL-round sub-workflow YAMLs live here (generated files).
+        self.rounds_dir = os.path.abspath("fl_rounds")
+        os.makedirs(self.rounds_dir, exist_ok=True)
+        # Path to the sub-workflow planning properties (set by
+        # write_subworkflow_conf()).
+        self.subwf_conf = None
 
     def write(self):
         if self.sc is not None:
@@ -207,11 +226,43 @@ class FedCastWorkflow:
             self.tc.add_transformations(tx)
 
     # ------------------------------------------------------------------
-    # Replica Catalog — no pre-staged inputs: everything is fetched at
-    # runtime from public sources (MRMS S3, Iowa Mesonet, NCEI).
+    # Replica Catalog — no pre-staged data inputs (everything is fetched
+    # at runtime from public sources). Registers the shared training
+    # helper module and, later, the generated FL-round sub-workflow YAMLs
+    # (appended during create_workflow()).
     # ------------------------------------------------------------------
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
+        self.rc.add_replica(
+            "local", COMMON_LFN,
+            "file://" + os.path.join(self.wf_dir, "bin", COMMON_LFN),
+        )
+
+    # ------------------------------------------------------------------
+    # Sub-workflow planning configuration: FL-round SubWorkflows are
+    # planned at runtime and need catalog locations + a replica catalog
+    # entry for the shared helper module.
+    # ------------------------------------------------------------------
+    def write_subworkflow_conf(self):
+        sub_rc = ReplicaCatalog()
+        sub_rc.add_replica(
+            "local", COMMON_LFN,
+            "file://" + os.path.join(self.wf_dir, "bin", COMMON_LFN),
+        )
+        sub_rc_path = os.path.abspath("fl_subwf_rc.yml")
+        sub_rc.write(sub_rc_path)
+
+        self.subwf_conf = os.path.abspath("fl_subwf.properties")
+        with open(self.subwf_conf, "w") as f:
+            f.write("pegasus.catalog.transformation=YAML\n")
+            f.write("pegasus.catalog.transformation.file="
+                    f"{os.path.abspath('transformations.yml')}\n")
+            if not self.args.skip_sites_catalog:
+                f.write("pegasus.catalog.site=YAML\n")
+                f.write("pegasus.catalog.site.file="
+                        f"{os.path.abspath('sites.yml')}\n")
+            f.write("pegasus.catalog.replica=YAML\n")
+            f.write(f"pegasus.catalog.replica.file={sub_rc_path}\n")
 
     # ------------------------------------------------------------------
     # Workflow DAG
@@ -346,20 +397,29 @@ class FedCastWorkflow:
         self.wf.add_jobs(bench_job)
 
     # -- Phase C: training ------------------------------------------------
-    def _add_training_chain(self, method, interval, mode, extra_args=None):
-        """Add a chain of checkpointed training segment jobs.
+    def _client_specs(self):
+        """LFN dicts for all clients, as consumed by fl_round."""
+        return [
+            {"name": site,
+             "sequences": self.site_files[site]["sequences"].lfn,
+             "manifest": self.site_files[site]["manifest"].lfn}
+            for site in self.sites
+        ]
 
-        Each segment runs `--segment-size` epochs (centralized) or rounds
-        (federated), carrying a state tarball (weights + best-so-far +
-        validation history) to the next segment. The final segment also
-        emits the best checkpoint as a staged-out output (SPEC Sec. 2,
+    def _add_centralized_chain(self, method, interval, extra_args=None):
+        """Chain of checkpointed centralized training segment jobs.
+
+        Each segment runs `--segment-size` epochs, carrying a state
+        tarball (weights + best-so-far + validation history) to the next
+        segment. The final segment emits the best checkpoint (SPEC
         constraint 9: lowest generator validation loss).
         """
         total = self.args.rounds
         seg_size = min(self.args.segment_size, total)
         n_segments = (total + seg_size - 1) // seg_size
 
-        seq_inputs = []
+        common = File(COMMON_LFN)
+        seq_inputs = [common]
         for site in self.sites:
             seq_inputs.append(self.site_files[site]["sequences"])
             seq_inputs.append(self.site_files[site]["manifest"])
@@ -374,7 +434,6 @@ class FedCastWorkflow:
                     _id=f"train_{method}_L{interval}_seg{k}",
                     node_label=f"train_{method}_L{interval}_seg{k}")
                 .add_args(
-                    "--mode", mode,
                     "--interval-months", str(interval),
                     "--archive-start", self.months[0],
                     "--archive-months", str(len(self.months)),
@@ -410,24 +469,122 @@ class FedCastWorkflow:
 
         self.best_ckpts[(method, interval)] = best_ckpt
 
+    def _add_federated_subworkflows(self, method, interval, aggregation):
+        """Federated training: one SubWorkflow per FL round.
+
+        fl_init seeds the global model; each round's sub-DAG fans out one
+        local epoch per client, aggregates (FedAvg), and — on validation
+        rounds — chains the history and best-so-far checkpoint. The final
+        round emits {method}_L{interval}_best.ckpt.
+        """
+        rounds = self.args.rounds
+        clients = self._client_specs()
+        common = File(COMMON_LFN)
+
+        init_names = init_file_names(method, interval)
+        init_global = File(init_names["global_out"])
+        init_history = File(init_names["history_out"])
+        init_best = File(init_names["best_out"])
+        init_job = (
+            Job("fl_init",
+                _id=f"flinit_{method}_L{interval}",
+                node_label=f"flinit_{method}_L{interval}")
+            .add_args(
+                "--seed", str(self.args.train_seed),
+                "--interval-months", str(interval),
+                "--aggregation", aggregation,
+                "--global-out", init_global,
+                "--history-out", init_history,
+                "--best-out", init_best,
+            )
+            .add_inputs(common)
+            .add_outputs(init_global, stage_out=False,
+                         register_replica=False)
+            .add_outputs(init_history, stage_out=False,
+                         register_replica=False)
+            .add_outputs(init_best, stage_out=False,
+                         register_replica=False)
+            .add_pegasus_profiles(label=f"{method}_L{interval}")
+        )
+        self.wf.add_jobs(init_job)
+
+        prev_global = init_names["global_out"]
+        prev_history = init_names["history_out"]
+        prev_best = init_names["best_out"]
+        best_ckpt_lfn = f"{method}_L{interval}_best.ckpt"
+
+        limit = getattr(self.args, "limit_train_sequences", None)
+        for r in range(rounds):
+            is_final = r == rounds - 1
+            is_validation = ((r + 1) % self.args.validate_every == 0
+                             or is_final)
+
+            round_wf, names = generate_round_workflow(
+                method=method,
+                interval=interval,
+                round_num=r,
+                clients=clients,
+                prev_global_lfn=prev_global,
+                prev_history_lfn=prev_history,
+                prev_best_lfn=prev_best,
+                aggregation=aggregation,
+                archive_start=self.months[0],
+                archive_months=len(self.months),
+                seed=self.args.train_seed,
+                is_validation_round=is_validation,
+                final_best_lfn=best_ckpt_lfn if is_final else None,
+                limit_train_sequences=limit,
+            )
+            yml_lfn = f"{method}_L{interval}_r{r:03d}.yml"
+            yml_path = os.path.join(self.rounds_dir, yml_lfn)
+            round_wf.write(yml_path)
+            self.rc.add_replica("local", yml_lfn,
+                                "file://" + os.path.abspath(yml_path))
+
+            subwf = SubWorkflow(
+                yml_lfn, is_planned=False,
+                _id=f"round_{method}_L{interval}_r{r:03d}",
+                node_label=f"round_{method}_L{interval}_r{r:03d}",
+            )
+            subwf.add_args("--conf", self.subwf_conf,
+                           "--output-sites", "local")
+            subwf.add_inputs(File(prev_global))
+            for site in self.sites:
+                subwf.add_inputs(self.site_files[site]["sequences"],
+                                 self.site_files[site]["manifest"])
+            subwf.add_outputs(File(names["global_out"]), stage_out=False,
+                              register_replica=False)
+            if is_validation:
+                subwf.add_inputs(File(prev_history), File(prev_best))
+                subwf.add_outputs(File(names["history_out"]),
+                                  stage_out=is_final,
+                                  register_replica=False)
+                subwf.add_outputs(File(names["best_out"]), stage_out=False,
+                                  register_replica=False)
+                prev_history = names["history_out"]
+                prev_best = names["best_out"]
+            if is_final:
+                subwf.add_outputs(File(best_ckpt_lfn), stage_out=True,
+                                  register_replica=False)
+            self.wf.add_jobs(subwf)
+            prev_global = names["global_out"]
+
+        self.best_ckpts[(method, interval)] = File(best_ckpt_lfn)
+
     def _add_phase_c_training(self):
         for interval in self.intervals:
             if "e1" in self.experiments:
-                self._add_training_chain("cen", interval, "centralized")
-                self._add_training_chain(
-                    "fed", interval, "federated",
-                    extra_args=[("--aggregation", "uniform")],
-                )
+                self._add_centralized_chain("cen", interval)
+                self._add_federated_subworkflows("fed", interval,
+                                                 "uniform")
             if "e21" in self.experiments:
-                self._add_training_chain(
-                    "fedq", interval, "federated",
-                    extra_args=[("--aggregation", "quadratic")],
-                )
+                self._add_federated_subworkflows("fedq", interval,
+                                                 "quadratic")
             if "e22" in self.experiments:
                 for rho in self.args.sam_rho:
                     method = f"censam{str(rho).replace('0.', '')}"
-                    self._add_training_chain(
-                        method, interval, "centralized",
+                    self._add_centralized_chain(
+                        method, interval,
                         extra_args=[("--sam-rho", str(rho))],
                     )
 
@@ -689,6 +846,7 @@ Examples:
         workflow.create_transformation_catalog(
             exec_site_name=args.execution_site_name)
         workflow.create_replica_catalog()
+        workflow.write_subworkflow_conf()
         workflow.create_workflow()
         workflow.write()
 

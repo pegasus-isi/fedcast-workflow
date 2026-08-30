@@ -26,3 +26,8 @@ _CR_escience_2026.pdf
 
 # IDE
 .idea/
+
+# Generated FL-round sub-workflow files
+fl_rounds/
+fl_subwf.properties
+fl_subwf_rc.yml
