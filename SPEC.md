@@ -314,8 +314,12 @@ framing.
    plannings per (method, L) and per-round staging of the global model and client
    sequence files; gained: per-client job placement (true multi-site federation
    becomes possible), per-round retry granularity, and per-round visibility.
-   Follow-up: verify parent↔sub-workflow file-flow semantics (stage_out /
-   --output-sites) on the cluster at pilot scale before full runs.
+   Follow-up RESOLVED (2026-08-30, pilot run0004): sub-to-sub chaining works
+   natively (round r+1 consumes round r's global model via runtime planning),
+   but parent jobs cannot consume sub-workflow outputs directly — subs stage
+   outputs to the output site while parent stage-ins expect parent scratch.
+   Bridged with a local `collect_file` (/bin/cp) job that re-introduces the
+   final best checkpoint into parent staging under the canonical LFN.
 7. **GPU budget.** 6 intervals × (centralized + federated) + E2.1 (6) + E2.2 (2 ρ ×
    6) ≈ 30 DGMR training runs of 100 epochs/rounds each on ~4.5K–33K sequences.
    Need an estimate of hours-per-run on available GPUs (Chameleon A100? FABRIC?)

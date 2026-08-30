@@ -251,6 +251,15 @@ class FedCastWorkflow:
                            FEDCAST_BATCH_SIZE="1")
             self.tc.add_transformations(tx)
 
+        # Local bridge for sub-workflow outputs consumed by parent jobs:
+        # sub-workflows stage their outputs to the output site, while
+        # parent stage-ins expect parent-scratch locations, so a plain
+        # local cp re-introduces the file into normal parent staging.
+        self.tc.add_transformations(
+            Transformation("collect_file", site="local", pfn="/bin/cp",
+                           is_stageable=False)
+        )
+
     # ------------------------------------------------------------------
     # Replica Catalog — no pre-staged data inputs (everything is fetched
     # at runtime from public sources). Registers the shared training
@@ -548,7 +557,12 @@ class FedCastWorkflow:
         prev_global = init_names["global_out"]
         prev_history = init_names["history_out"]
         prev_best = init_names["best_out"]
-        best_ckpt_lfn = f"{method}_L{interval}_best.ckpt"
+        # The sub-workflow stages its final-best checkpoint to the output
+        # site under a "_sub" name; a collect_file bridge job then brings
+        # it into parent staging under the canonical LFN (parent stage-ins
+        # cannot see sub-workflow output locations directly).
+        sub_best_lfn = f"{method}_L{interval}_best_sub.ckpt"
+        last_subwf = None
 
         limit = getattr(self.args, "limit_train_sequences", None)
         for r in range(rounds):
@@ -569,7 +583,7 @@ class FedCastWorkflow:
                 archive_months=len(self.months),
                 seed=self.args.train_seed,
                 is_validation_round=is_validation,
-                final_best_lfn=best_ckpt_lfn if is_final else None,
+                final_best_lfn=sub_best_lfn if is_final else None,
                 limit_train_sequences=limit,
             )
             yml_lfn = f"{method}_L{interval}_r{r:03d}.yml"
@@ -601,12 +615,27 @@ class FedCastWorkflow:
                 prev_history = names["history_out"]
                 prev_best = names["best_out"]
             if is_final:
-                subwf.add_outputs(File(best_ckpt_lfn), stage_out=True,
+                subwf.add_outputs(File(sub_best_lfn), stage_out=True,
                                   register_replica=False)
             self.wf.add_jobs(subwf)
+            last_subwf = subwf
             prev_global = names["global_out"]
 
-        self.best_ckpts[(method, interval)] = File(best_ckpt_lfn)
+        best_ckpt = File(f"{method}_L{interval}_best.ckpt")
+        collect_job = (
+            Job("collect_file",
+                _id=f"collect_{method}_L{interval}",
+                node_label=f"collect_{method}_L{interval}")
+            .add_args(os.path.join(self.local_storage_dir, sub_best_lfn),
+                      best_ckpt)
+            .add_outputs(best_ckpt, stage_out=True, register_replica=False)
+        )
+        self.wf.add_jobs(collect_job)
+        # No declared file input (the source is an absolute output-site
+        # path), so the ordering edge must be explicit.
+        self.wf.add_dependency(collect_job, parents=[last_subwf])
+
+        self.best_ckpts[(method, interval)] = best_ckpt
 
     def _add_phase_c_training(self):
         for interval in self.intervals:
