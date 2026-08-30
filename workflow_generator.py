@@ -289,6 +289,14 @@ class FedCastWorkflow:
                         f"{os.path.abspath('sites.yml')}\n")
             f.write("pegasus.catalog.replica=YAML\n")
             f.write(f"pegasus.catalog.replica.file={sub_rc_path}\n")
+            # Sub-workflows are planned with THIS conf, not the parent's
+            # pegasus.properties — the worker-package settings must be
+            # repeated here or sub-DAG jobs fail inside containers
+            # (PegasusLite platform mismatch, no curl in image).
+            f.write("pegasus.transfer.threads=16\n")
+            f.write("pegasus.transfer.worker.package=true\n")
+            f.write("pegasus.transfer.worker.package.strict=false\n")
+            f.write("pegasus.transfer.worker.package.autodownload=false\n")
 
     # ------------------------------------------------------------------
     # Workflow DAG
