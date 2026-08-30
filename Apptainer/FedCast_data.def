@@ -7,7 +7,7 @@ From: python:3.11-slim
 
 %post
     apt-get update && apt-get install -y --no-install-recommends \
-        libeccodes0 libeccodes-tools \
+        libeccodes0 libeccodes-tools curl \
         && rm -rf /var/lib/apt/lists/*
 
     pip install --no-cache-dir \

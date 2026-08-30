@@ -162,6 +162,14 @@ class FedCastWorkflow:
     def create_pegasus_properties(self):
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
+        # Jobs run inside containers whose OS differs from the submit
+        # host (Debian 13 / Ubuntu 22 vs Ubuntu 24). Use the staged
+        # worker package regardless of platform mismatch instead of
+        # attempting a download the containers can't perform.
+        self.props["pegasus.transfer.worker.package"] = "true"
+        self.props["pegasus.transfer.worker.package.strict"] = "false"
+        self.props["pegasus.transfer.worker.package.autodownload"] = \
+            "false"
         # Throttle the (site x month) fetch fan-out so we do not hammer the
         # MRMS S3 bucket or the submit host's disk with 336 parallel pulls.
         self.props["dagman.maxjobs"] = str(self.args.max_concurrent_jobs)

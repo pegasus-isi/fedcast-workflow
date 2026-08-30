@@ -6,6 +6,9 @@ From: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
     Purpose Fed-Cast training phase: DGMR centralized + federated (FedAvg)
 
 %post
+    apt-get update && apt-get install -y --no-install-recommends curl \
+        && rm -rf /var/lib/apt/lists/*
+
     # Pin versions once the paper's exact releases are known
     # (SPEC.md open question 9).
     pip install --no-cache-dir \
