@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+
+"""Pegasus workflow generator for the Fed-Cast reproduction (fedcast-workflow).
+
+Reproduces the Fed-Cast paper (Xu et al., eScience 2026): federated vs.
+centralized DGMR precipitation nowcasting on MRMS PrecipRate, evaluated with
+an MCT-style multi-metric + TOPSIS pipeline against a STEPS baseline.
+See SPEC.md for the full design, constraints, and validation criteria.
+
+Pipeline phases (SPEC.md Sec. 1.1):
+  A. Data       — fetch+crop MRMS per (site, month), build sequences per site
+  B. Benchmark  — fetch WPC MPD / LSR / StormEvents, compile frozen event set
+  C. Training   — per interval L: centralized DGMR and federated DGMR (Flower),
+                  as chains of checkpointed segment jobs (SPEC open question 6b)
+  D. Evaluation — MCT-style inference + verification per (method, L), TOPSIS
+  E. Ablations  — E2.1 quadratic client weighting, E2.2 SAM centralized
+
+Usage:
+    # Pilot (2 sites, 1 month, tiny training budget):
+    ./workflow_generator.py --test
+
+    # Full E1 reproduction (7 sites, 48 months, 100 rounds/epochs):
+    ./workflow_generator.py --start-month 2021-01 --months 48
+
+    # Include ablations:
+    ./workflow_generator.py --start-month 2021-01 --months 48 \
+        --experiments e1 e21 e22
+"""
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+from Pegasus.api import *
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# The seven radar-centered regional clients (paper Sec. III-B).
+# Coordinates from the NCEI NEXRAD station list; each client is a 3°x3°
+# window centered on the radar, cropped to a 300x300 field at 0.01°.
+# NOTE: PAHG (Alaska) is outside the MRMS CONUS domain — see SPEC.md open
+# question 3. The fetch wrapper selects the MRMS ALASKA product tree for it.
+# ----------------------------------------------------------------------
+SITES = {
+    "KBYX": {"lat": 24.5975, "lon": -81.7032, "domain": "CONUS",
+             "desc": "subtropical maritime convection (Key West, FL)"},
+    "KTLX": {"lat": 35.3331, "lon": -97.2778, "domain": "CONUS",
+             "desc": "southern Great Plains convection (Oklahoma City, OK)"},
+    "KVNX": {"lat": 36.7406, "lon": -98.1279, "domain": "CONUS",
+             "desc": "central Great Plains convection (Vance AFB, OK)"},
+    "KLGX": {"lat": 47.1158, "lon": -124.1069, "domain": "CONUS",
+             "desc": "Pacific coastal / orographic (Langley Hill, WA)"},
+    "KENX": {"lat": 42.5865, "lon": -74.0639, "domain": "CONUS",
+             "desc": "inland Northeast (Albany, NY)"},
+    "KBOX": {"lat": 41.9558, "lon": -71.1369, "domain": "CONUS",
+             "desc": "coastal Northeast (Boston, MA)"},
+    "PAHG": {"lat": 60.7259, "lon": -151.3512, "domain": "ALASKA",
+             "desc": "high-latitude coastal/mountainous (Kenai, AK)"},
+}
+
+EVENT_SOURCES = ["mpd", "lsr", "storm_events"]
+
+# Per-tool resource configuration.
+TOOL_CONFIGS = {
+    "fetch_crop_mrms":      {"memory": "4 GB",  "cores": 1, "container": "data"},
+    "preprocess_sequences": {"memory": "16 GB", "cores": 4, "container": "data"},
+    "fetch_events":         {"memory": "2 GB",  "cores": 1, "container": "data"},
+    "build_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data"},
+    "train_dgmr":           {"memory": "32 GB", "cores": 8, "container": "train",
+                             "gpus": 1},
+    "mct_infer":            {"memory": "16 GB", "cores": 4, "container": "eval",
+                             "gpus": 1},
+    "mct_verify":           {"memory": "8 GB",  "cores": 4, "container": "eval"},
+    "mct_topsis":           {"memory": "2 GB",  "cores": 1, "container": "eval"},
+    "make_figures":         {"memory": "4 GB",  "cores": 1, "container": "eval"},
+    "validate_report":      {"memory": "4 GB",  "cores": 1, "container": "eval"},
+}
+
+
+def month_range(start_month, n_months):
+    """Return a list of YYYY-MM strings starting at start_month."""
+    year, month = (int(x) for x in start_month.split("-"))
+    months = []
+    for _ in range(n_months):
+        months.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return months
+
+
+class FedCastWorkflow:
+    """Fed-Cast reproduction workflow (see SPEC.md)."""
+
+    wf = None
+    sc = None
+    tc = None
+    rc = None
+    props = None
+
+    wf_name = "fedcast"
+
+    def __init__(self, args):
+        self.args = args
+        self.dagfile = args.output
+        self.wf_dir = str(Path(__file__).parent.resolve())
+        self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
+        self.local_storage_dir = os.path.join(self.wf_dir, "output")
+
+        self.sites = args.sites
+        self.months = month_range(args.start_month, args.months)
+        self.intervals = sorted(args.intervals)
+        self.experiments = args.experiments
+
+        # Per-site sequence/manifest files shared across phases.
+        self.site_files = {}
+        # Per-method best checkpoints: {(method, L): File}
+        self.best_ckpts = {}
+        # Benchmark file shared between Phase B and D.
+        self.benchmark_file = None
+        # Metric CSVs collected for TOPSIS pools: {method: {L: File}}
+        self.metric_files = {}
+
+    def write(self):
+        if self.sc is not None:
+            self.sc.write()
+        self.props.write()
+        self.rc.write()
+        self.tc.write()
+        self.wf.write(file=self.dagfile)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    def create_pegasus_properties(self):
+        self.props = Properties()
+        self.props["pegasus.transfer.threads"] = "16"
+        # Throttle the (site x month) fetch fan-out so we do not hammer the
+        # MRMS S3 bucket or the submit host's disk with 336 parallel pulls.
+        self.props["dagman.maxjobs"] = str(self.args.max_concurrent_jobs)
+
+    # ------------------------------------------------------------------
+    # Site Catalog
+    # ------------------------------------------------------------------
+    def create_sites_catalog(self, exec_site_name="condorpool"):
+        self.sc = SiteCatalog()
+
+        local = Site("local").add_directories(
+            Directory(
+                Directory.SHARED_SCRATCH, self.shared_scratch_dir
+            ).add_file_servers(
+                FileServer("file://" + self.shared_scratch_dir, Operation.ALL)
+            ),
+            Directory(
+                Directory.LOCAL_STORAGE, self.local_storage_dir
+            ).add_file_servers(
+                FileServer("file://" + self.local_storage_dir, Operation.ALL)
+            ),
+        )
+
+        exec_site = (
+            Site(exec_site_name)
+            .add_condor_profile(universe="vanilla")
+            .add_pegasus_profile(style="condor")
+        )
+
+        self.sc.add_sites(local, exec_site)
+
+    # ------------------------------------------------------------------
+    # Transformation Catalog
+    # ------------------------------------------------------------------
+    def create_transformation_catalog(self, exec_site_name="condorpool"):
+        self.tc = TransformationCatalog()
+
+        containers = {}
+        for name in ("data", "train", "eval"):
+            containers[name] = Container(
+                f"fedcast_{name}",
+                container_type=Container.SINGULARITY,
+                image="file://" + os.path.join(
+                    self.wf_dir, "Apptainer", f"FedCast_{name}.sif"
+                ),
+                image_site="local",
+            )
+        self.tc.add_containers(*containers.values())
+
+        for tool_name, cfg in TOOL_CONFIGS.items():
+            tx = Transformation(
+                tool_name,
+                site=exec_site_name,
+                pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
+                is_stageable=True,
+                container=containers[cfg["container"]],
+            ).add_pegasus_profile(
+                memory=cfg["memory"], cores=cfg.get("cores", 1)
+            )
+            if cfg.get("gpus"):
+                tx.add_condor_profile(request_gpus=str(cfg["gpus"]))
+            self.tc.add_transformations(tx)
+
+    # ------------------------------------------------------------------
+    # Replica Catalog — no pre-staged inputs: everything is fetched at
+    # runtime from public sources (MRMS S3, Iowa Mesonet, NCEI).
+    # ------------------------------------------------------------------
+    def create_replica_catalog(self):
+        self.rc = ReplicaCatalog()
+
+    # ------------------------------------------------------------------
+    # Workflow DAG
+    # ------------------------------------------------------------------
+    def create_workflow(self):
+        self.wf = Workflow(self.wf_name, infer_dependencies=True)
+
+        self._add_phase_a_data()
+        self._add_phase_b_benchmark()
+        self._add_phase_c_training()
+        self._add_phase_d_evaluation()
+
+    # -- Phase A: data construction ------------------------------------
+    def _add_phase_a_data(self):
+        # One fetch job per (domain, month): each MRMS PrecipRate file is
+        # downloaded once and cropped for every site in that domain in the
+        # same pass (crop-on-ingest — SPEC open question 8). Full-domain
+        # GRIB2 files are never persisted.
+        domains = {}
+        for site in self.sites:
+            domains.setdefault(SITES[site]["domain"], []).append(site)
+
+        cropped_files = {site: [] for site in self.sites}
+        for domain, domain_sites in domains.items():
+            for month in self.months:
+                outputs = {
+                    site: File(f"{site}_{month}_cropped.nc")
+                    for site in domain_sites
+                }
+                fetch_job = (
+                    Job("fetch_crop_mrms",
+                        _id=f"fetch_{domain}_{month}",
+                        node_label=f"fetch_{domain}_{month}")
+                    .add_args(
+                        "--domain", domain,
+                        "--month", month,
+                        "--stride", str(self.args.frame_stride),
+                    )
+                    .add_pegasus_profiles(label=f"fetch_{domain}")
+                    # Required source: wrapper retries transients with
+                    # backoff, writes declared outputs even on permanent
+                    # failure, then exits non-zero (SPEC constraint 17).
+                    .add_dagman_profile(retry="2")
+                )
+                for site in domain_sites:
+                    info = SITES[site]
+                    fetch_job.add_args(
+                        "--site",
+                        f"{site}:{info['lat']}:{info['lon']}"
+                        f":{outputs[site].lfn}",
+                    )
+                    fetch_job.add_outputs(outputs[site], stage_out=False,
+                                          register_replica=False)
+                    cropped_files[site].append(outputs[site])
+                self.wf.add_jobs(fetch_job)
+
+        for site in self.sites:
+            month_files = cropped_files[site]
+            sequences = File(f"{site}_sequences.npz")
+            manifest = File(f"{site}_manifest.json")
+            prep_job = (
+                Job("preprocess_sequences",
+                    _id=f"prep_{site}", node_label=f"prep_{site}")
+                .add_args(
+                    "--site", site,
+                    "--output-sequences", sequences,
+                    "--output-manifest", manifest,
+                    "--val-seed", str(self.args.split_seed),
+                    "--rain-threshold", str(self.args.rain_threshold),
+                    "--min-rain-fraction", str(self.args.min_rain_fraction),
+                )
+                .add_inputs(*month_files)
+                .add_outputs(sequences, stage_out=False,
+                             register_replica=False)
+                # Manifests are validation artifacts (SPEC Tier 0/1).
+                .add_outputs(manifest, stage_out=True,
+                             register_replica=False)
+                .add_pegasus_profiles(label=site)
+            )
+            for f in month_files:
+                prep_job.add_args("--input", f)
+            self.wf.add_jobs(prep_job)
+
+            self.site_files[site] = {
+                "sequences": sequences, "manifest": manifest
+            }
+
+    # -- Phase B: event benchmark ---------------------------------------
+    def _add_phase_b_benchmark(self):
+        source_files = []
+        for source in EVENT_SOURCES:
+            events = File(f"events_{source}.json")
+            job = (
+                Job("fetch_events",
+                    _id=f"fetch_events_{source}",
+                    node_label=f"fetch_events_{source}")
+                .add_args(
+                    "--source", source,
+                    "--start-month", self.months[0],
+                    "--end-month", self.months[-1],
+                    "--output", events,
+                )
+                .add_outputs(events, stage_out=False, register_replica=False)
+                # Best-effort source: wrapper degrades gracefully (empty
+                # output + exit 0); build_benchmark fails only if ALL
+                # sources are empty (SPEC constraint 17).
+                .add_dagman_profile(retry="2")
+            )
+            self.wf.add_jobs(job)
+            source_files.append(events)
+
+        self.benchmark_file = File("benchmark_events.csv")
+        bench_job = (
+            Job("build_benchmark",
+                _id="build_benchmark", node_label="build_benchmark")
+            .add_args(
+                "--output", self.benchmark_file,
+                "--seed", str(self.args.split_seed),
+                "--max-events-per-site", str(self.args.max_events_per_site),
+            )
+            .add_inputs(*source_files)
+            .add_outputs(self.benchmark_file, stage_out=True,
+                         register_replica=False)
+        )
+        for f in source_files:
+            bench_job.add_args("--events", f)
+        for site in self.sites:
+            info = SITES[site]
+            bench_job.add_args(
+                "--site", f"{site}:{info['lat']}:{info['lon']}"
+            )
+        self.wf.add_jobs(bench_job)
+
+    # -- Phase C: training ------------------------------------------------
+    def _add_training_chain(self, method, interval, mode, extra_args=None):
+        """Add a chain of checkpointed training segment jobs.
+
+        Each segment runs `--segment-size` epochs (centralized) or rounds
+        (federated), carrying a state tarball (weights + best-so-far +
+        validation history) to the next segment. The final segment also
+        emits the best checkpoint as a staged-out output (SPEC Sec. 2,
+        constraint 9: lowest generator validation loss).
+        """
+        total = self.args.rounds
+        seg_size = min(self.args.segment_size, total)
+        n_segments = (total + seg_size - 1) // seg_size
+
+        seq_inputs = []
+        for site in self.sites:
+            seq_inputs.append(self.site_files[site]["sequences"])
+            seq_inputs.append(self.site_files[site]["manifest"])
+
+        prev_state = None
+        best_ckpt = File(f"{method}_L{interval}_best.ckpt")
+        for k in range(n_segments):
+            state_out = File(f"{method}_L{interval}_seg{k}_state.tar.gz")
+            is_last = k == n_segments - 1
+            job = (
+                Job("train_dgmr",
+                    _id=f"train_{method}_L{interval}_seg{k}",
+                    node_label=f"train_{method}_L{interval}_seg{k}")
+                .add_args(
+                    "--mode", mode,
+                    "--interval-months", str(interval),
+                    "--archive-start", self.months[0],
+                    "--archive-months", str(len(self.months)),
+                    "--segment-index", str(k),
+                    "--segment-size", str(seg_size),
+                    "--total-units", str(total),
+                    "--validate-every", str(self.args.validate_every),
+                    "--seed", str(self.args.train_seed),
+                    "--state-out", state_out,
+                )
+                .add_inputs(*seq_inputs)
+                .add_outputs(state_out, stage_out=False,
+                             register_replica=False)
+                .add_pegasus_profiles(label=f"{method}_L{interval}")
+            )
+            for site in self.sites:
+                job.add_args(
+                    "--client",
+                    f"{site}:{self.site_files[site]['sequences'].lfn}"
+                    f":{self.site_files[site]['manifest'].lfn}",
+                )
+            for arg in (extra_args or []):
+                job.add_args(*arg)
+            if prev_state is not None:
+                job.add_args("--state-in", prev_state)
+                job.add_inputs(prev_state)
+            if is_last:
+                job.add_args("--best-out", best_ckpt)
+                job.add_outputs(best_ckpt, stage_out=True,
+                                register_replica=False)
+            self.wf.add_jobs(job)
+            prev_state = state_out
+
+        self.best_ckpts[(method, interval)] = best_ckpt
+
+    def _add_phase_c_training(self):
+        for interval in self.intervals:
+            if "e1" in self.experiments:
+                self._add_training_chain("cen", interval, "centralized")
+                self._add_training_chain(
+                    "fed", interval, "federated",
+                    extra_args=[("--aggregation", "uniform")],
+                )
+            if "e21" in self.experiments:
+                self._add_training_chain(
+                    "fedq", interval, "federated",
+                    extra_args=[("--aggregation", "quadratic")],
+                )
+            if "e22" in self.experiments:
+                for rho in self.args.sam_rho:
+                    method = f"censam{str(rho).replace('0.', '')}"
+                    self._add_training_chain(
+                        method, interval, "centralized",
+                        extra_args=[("--sam-rho", str(rho))],
+                    )
+
+    # -- Phase D: evaluation ----------------------------------------------
+    def _add_eval_pair(self, method, interval, ckpt=None):
+        """Add mct_infer + mct_verify for one (method, interval)."""
+        tag = f"{method}_L{interval}" if interval else method
+        forecasts = File(f"{tag}_forecasts.npz")
+
+        seq_inputs = []
+        for site in self.sites:
+            seq_inputs.append(self.site_files[site]["sequences"])
+            seq_inputs.append(self.site_files[site]["manifest"])
+
+        infer_job = (
+            Job("mct_infer", _id=f"infer_{tag}", node_label=f"infer_{tag}")
+            .add_args(
+                "--method", method,
+                "--benchmark", self.benchmark_file,
+                "--ensemble-size",
+                str(20 if method == "steps" else self.args.dgmr_ensemble),
+                "--output", forecasts,
+            )
+            .add_inputs(self.benchmark_file, *seq_inputs)
+            .add_outputs(forecasts, stage_out=False, register_replica=False)
+            .add_pegasus_profiles(label=tag)
+        )
+        for site in self.sites:
+            infer_job.add_args(
+                "--client",
+                f"{site}:{self.site_files[site]['sequences'].lfn}"
+                f":{self.site_files[site]['manifest'].lfn}",
+            )
+        if ckpt is not None:
+            infer_job.add_args("--checkpoint", ckpt)
+            infer_job.add_inputs(ckpt)
+        self.wf.add_jobs(infer_job)
+
+        metrics = File(f"{tag}_metrics.csv")
+        verify_job = (
+            Job("mct_verify", _id=f"verify_{tag}", node_label=f"verify_{tag}")
+            .add_args(
+                "--method", method,
+                "--interval", str(interval) if interval else "",
+                "--forecasts", forecasts,
+                "--benchmark", self.benchmark_file,
+                "--rain-threshold", str(self.args.rain_threshold),
+                "--output", metrics,
+            )
+            .add_inputs(forecasts, self.benchmark_file, *seq_inputs)
+            .add_outputs(metrics, stage_out=True, register_replica=False)
+            .add_pegasus_profiles(label=tag)
+        )
+        for site in self.sites:
+            verify_job.add_args(
+                "--client",
+                f"{site}:{self.site_files[site]['sequences'].lfn}"
+                f":{self.site_files[site]['manifest'].lfn}",
+            )
+        self.wf.add_jobs(verify_job)
+
+        self.metric_files.setdefault(method, {})[interval] = metrics
+        return metrics
+
+    def _add_phase_d_evaluation(self):
+        # STEPS is training-free: a single evaluation reused by all pools.
+        steps_metrics = self._add_eval_pair("steps", None)
+
+        for (method, interval), ckpt in self.best_ckpts.items():
+            self._add_eval_pair(method, interval, ckpt=ckpt)
+
+        # TOPSIS pools — separately normalized per experiment (SPEC
+        # constraint 14). E1: cen+fed+steps; E2.1: fedq+cen+steps;
+        # E2.2: censam*+fed+steps.
+        pools = {}
+        if "e1" in self.experiments:
+            pools["e1"] = ["cen", "fed"]
+        if "e21" in self.experiments:
+            pools["e21"] = ["cen", "fedq"]
+        if "e22" in self.experiments:
+            pools["e22"] = ["fed"] + [
+                f"censam{str(rho).replace('0.', '')}"
+                for rho in self.args.sam_rho
+            ]
+
+        topsis_files = []
+        for pool_name, methods in pools.items():
+            pool_inputs = [steps_metrics]
+            topsis_out = File(f"{pool_name}_topsis.csv")
+            topsis_job = (
+                Job("mct_topsis",
+                    _id=f"topsis_{pool_name}",
+                    node_label=f"topsis_{pool_name}")
+                .add_args("--pool", pool_name, "--output", topsis_out)
+                .add_outputs(topsis_out, stage_out=True,
+                             register_replica=False)
+            )
+            topsis_job.add_args("--metrics", steps_metrics)
+            for method in methods:
+                for interval, mfile in self.metric_files[method].items():
+                    topsis_job.add_args("--metrics", mfile)
+                    pool_inputs.append(mfile)
+            topsis_job.add_inputs(*pool_inputs)
+            self.wf.add_jobs(topsis_job)
+            topsis_files.append(topsis_out)
+
+        figures = File("figures.tar.gz")
+        fig_job = (
+            Job("make_figures", _id="make_figures", node_label="make_figures")
+            .add_args("--output", figures)
+            .add_inputs(*topsis_files)
+            .add_outputs(figures, stage_out=True, register_replica=False)
+        )
+        for f in topsis_files:
+            fig_job.add_args("--topsis", f)
+        self.wf.add_jobs(fig_job)
+
+        # Tiered validation report (SPEC Sec. 5).
+        report = File("validation_report.md")
+        manifests = [self.site_files[s]["manifest"] for s in self.sites]
+        val_job = (
+            Job("validate_report",
+                _id="validate_report", node_label="validate_report")
+            .add_args("--output", report)
+            .add_inputs(*topsis_files, *manifests, self.benchmark_file)
+            .add_outputs(report, stage_out=True, register_replica=False)
+        )
+        for f in topsis_files:
+            val_job.add_args("--topsis", f)
+        for m in manifests:
+            val_job.add_args("--manifest", m)
+        val_job.add_args("--benchmark", self.benchmark_file)
+        self.wf.add_jobs(val_job)
+
+
+# ======================================================================
+# main()
+# ======================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fed-Cast reproduction workflow generator (see SPEC.md)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --test                          # pilot: 2 sites, 1 month, tiny budget
+  %(prog)s --start-month 2021-01 --months 48
+  %(prog)s --start-month 2021-01 --months 48 --experiments e1 e21 e22
+""",
+    )
+
+    # --- Standard Pegasus arguments ---
+    parser.add_argument("-s", "--skip-sites-catalog", action="store_true",
+                        help="Skip site catalog creation")
+    parser.add_argument("-e", "--execution-site-name", metavar="STR",
+                        type=str, default="condorpool",
+                        help="Execution site name (default: condorpool)")
+    parser.add_argument("-o", "--output", metavar="STR", type=str,
+                        default="workflow.yml",
+                        help="Output file (default: workflow.yml)")
+
+    # --- Data / archive ---
+    parser.add_argument("--start-month", type=str, default="2021-01",
+                        help="Archive start month YYYY-MM (default: 2021-01; "
+                             "SPEC open question 1)")
+    parser.add_argument("--months", type=int, default=48,
+                        help="Archive length in months (default: 48)")
+    parser.add_argument("--sites", type=str, nargs="+",
+                        default=list(SITES.keys()), choices=list(SITES.keys()),
+                        help="Radar sites / federated clients (default: all 7)")
+
+    # --- Training ---
+    parser.add_argument("--intervals", type=int, nargs="+",
+                        default=[1, 3, 6, 12, 24, 48],
+                        help="Training intervals L in months "
+                             "(default: 1 3 6 12 24 48)")
+    parser.add_argument("--rounds", type=int, default=100,
+                        help="FL rounds / centralized epochs (default: 100)")
+    parser.add_argument("--segment-size", type=int, default=10,
+                        help="Rounds/epochs per training segment job "
+                             "(default: 10)")
+    parser.add_argument("--validate-every", type=int, default=5,
+                        help="Validation cadence in rounds/epochs "
+                             "(default: 5, per paper)")
+    parser.add_argument("--experiments", type=str, nargs="+", default=["e1"],
+                        choices=["e1", "e21", "e22"],
+                        help="Experiment pools to build (default: e1)")
+    parser.add_argument("--sam-rho", type=float, nargs="+",
+                        default=[0.025, 0.0125],
+                        help="SAM perturbation radii for E2.2")
+    parser.add_argument("--train-seed", type=int, default=42,
+                        help="Training RNG seed, recorded in run metadata")
+
+    # --- Preprocessing / evaluation knobs (SPEC open questions 2, 5) ---
+    parser.add_argument("--split-seed", type=int, default=1337,
+                        help="Seed for validation-split sampling and "
+                             "benchmark event selection")
+    parser.add_argument("--rain-threshold", type=float, default=0.1,
+                        help="Rain/no-rain threshold in mm/h (default: 0.1)")
+    parser.add_argument("--min-rain-fraction", type=float, default=0.05,
+                        help="Min wet-pixel fraction for sequence retention "
+                             "(calibration knob; SPEC open question 2)")
+    parser.add_argument("--max-events-per-site", type=int, default=20,
+                        help="Benchmark balancing cap per site "
+                             "(SPEC open question 5)")
+    parser.add_argument("--dgmr-ensemble", type=int, default=6,
+                        help="DGMR stochastic ensemble size K (default: 6)")
+    parser.add_argument("--frame-stride", type=int, default=1,
+                        help="Keep every Nth 2-min MRMS frame (default: 1 = "
+                             "full cadence; >1 subsamples for pilot runs)")
+    parser.add_argument("--max-concurrent-jobs", type=int, default=20,
+                        help="DAGMan job throttle (default: 20)")
+
+    # --- Pilot mode ---
+    parser.add_argument("--test", action="store_true",
+                        help="Pilot mode: 2 sites, 1 month, 2 rounds, "
+                             "interval [1] — end-to-end smoke test")
+
+    args = parser.parse_args()
+
+    if args.test:
+        args.sites = ["KTLX", "KENX"]
+        args.months = 1
+        args.intervals = [1]
+        args.rounds = 2
+        args.segment_size = 1
+        args.validate_every = 1
+        args.max_events_per_site = 2
+        args.frame_stride = 5
+        logger.info("PILOT MODE: %s, %d month(s), %d round(s)",
+                    args.sites, args.months, args.rounds)
+
+    # --- Validation ---
+    if max(args.intervals) > args.months:
+        print(f"Error: largest interval ({max(args.intervals)}) exceeds "
+              f"archive length ({args.months} months)")
+        sys.exit(1)
+    if "e22" in args.experiments and not args.sam_rho:
+        print("Error: --experiments e22 requires at least one --sam-rho")
+        sys.exit(1)
+
+    logger.info("=" * 70)
+    logger.info("FED-CAST WORKFLOW GENERATOR")
+    logger.info("=" * 70)
+    logger.info(f"Sites: {args.sites}")
+    logger.info(f"Archive: {args.start_month} + {args.months} months")
+    logger.info(f"Intervals: {args.intervals}")
+    logger.info(f"Experiments: {args.experiments}")
+    logger.info(f"Training budget: {args.rounds} rounds/epochs in segments "
+                f"of {args.segment_size}")
+    logger.info(f"Execution site: {args.execution_site_name}")
+    logger.info("=" * 70)
+
+    try:
+        workflow = FedCastWorkflow(args)
+        workflow.create_pegasus_properties()
+        if not args.skip_sites_catalog:
+            workflow.create_sites_catalog(
+                exec_site_name=args.execution_site_name)
+        workflow.create_transformation_catalog(
+            exec_site_name=args.execution_site_name)
+        workflow.create_replica_catalog()
+        workflow.create_workflow()
+        workflow.write()
+
+        logger.info(f"\nWorkflow written to {args.output}")
+        logger.info(f"Submit: pegasus-plan --submit "
+                    f"-s {args.execution_site_name} -o local {args.output}")
+    except Exception as e:
+        logger.error(f"Failed to generate workflow: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

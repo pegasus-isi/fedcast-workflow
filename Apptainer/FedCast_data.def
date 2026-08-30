@@ -1,0 +1,28 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%labels
+    Maintainer kthare10
+    Purpose Fed-Cast data phase: MRMS fetch/crop, sequences, events, benchmark
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        libeccodes0 libeccodes-tools \
+        && rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        "numpy<2" \
+        boto3 \
+        requests \
+        xarray \
+        cfgrib \
+        eccodes \
+        netCDF4 \
+        pandas \
+        pyshp
+
+%environment
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec "$@"

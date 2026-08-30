@@ -1,0 +1,28 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Pegasus artifacts
+scratch/
+output/
+submit/
+workflow.yml
+sites.yml
+transformations.yml
+replicas.yml
+pegasus.properties
+braindump.yml
+
+# Large artifacts
+*.sif
+*.nc
+*.npz
+*.ckpt
+*.tar.gz
+
+# Paper camera-ready (copyrighted; not ours to redistribute)
+_CR_escience_2026.pdf
+
+# IDE
+.idea/

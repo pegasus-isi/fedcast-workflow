@@ -1,0 +1,22 @@
+# Fed-Cast workflow — submit-host requirements.
+# Job-side dependencies live in the Apptainer containers (Apptainer/*.def).
+
+# Workflow generation
+pegasus-wms.api
+
+# Local development / running bin/ scripts outside containers
+numpy<2
+boto3
+requests
+xarray
+cfgrib
+pyshp
+netCDF4
+pandas
+matplotlib
+
+# Training / evaluation (GPU host or dev box only)
+# torch
+# pytorch-lightning
+# dgmr
+# pysteps

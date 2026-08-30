@@ -1,0 +1,22 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+%labels
+    Maintainer kthare10
+    Purpose Fed-Cast training phase: DGMR centralized + federated (FedAvg)
+
+%post
+    # Pin versions once the paper's exact releases are known
+    # (SPEC.md open question 9).
+    pip install --no-cache-dir \
+        "numpy<2" \
+        pytorch-lightning \
+        dgmr \
+        einops \
+        pandas
+
+%environment
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec "$@"
