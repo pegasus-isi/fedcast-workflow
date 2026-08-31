@@ -290,11 +290,14 @@ framing.
    fraction, or per-sequence rule given). This directly drives the retained-sequence
    counts in Tier 1. *Proposal:* calibrate a (rain-fraction ≥ p at θ = 0.1 mm/h)
    rule to approximate the published counts, and document it as a deviation.
-3. **PAHG (Alaska) coverage.** MRMS CONUS products do not cover Alaska; MRMS has a
-   separate Alaska domain with its own product set and possibly different cadence/
-   availability on `noaa-mrms-pds`. Must verify PrecipRate exists for the Alaska
-   domain over the chosen window; if not, decide between substituting a CONUS site
-   (deviation) or a different Alaska product (deviation).
+3. **PAHG (Alaska) coverage.** ~~Must verify PrecipRate exists for the Alaska
+   domain over the chosen window.~~ **RESOLVED (2026-08-31, verified against the
+   live bucket):** `ALASKA/PrecipRate_00.00/` exists with the same archive start
+   as CONUS (2020-10-14), full 2-min cadence (720 files/day) at the start,
+   middle, and end of the proposed 2021-01→2024-12 window, and an identical
+   0.01° grid (2200×5000, lat 50–72, lon −176 to −126). A live decode+crop test
+   of a 2024-01-10 frame yielded an exact 300×300 PAHG window with 100% valid
+   pixels. No code changes required.
 4. **MCT reimplementation risk.** Since MCT is unreleased, subtle choices
    (ensemble-mean thresholding order, per-event vs. pooled contingency tables,
    TOPSIS candidate-pool membership per "experiment bundle") must be inferred. Worth
