@@ -224,31 +224,38 @@ class FedCastWorkflow:
                     container_arguments="--nv")
         self.tc.add_containers(*containers.values())
 
+        cap_gb = self.args.max_job_memory_gb
         for tool_name, cfg in TOOL_CONFIGS.items():
-            memory = cfg["memory"]
+            memory_gb = int(cfg["memory"].split()[0])
             cores = cfg.get("cores", 1)
             gpus = cfg.get("gpus")
-            if self.args.test:
-                # Pilot mode: keep GPU requests (the pool has GPU workers)
-                # but scale memory to fit ~15 GB machines; the FEDCAST_*
-                # env shrinks the model to match (fedcast_common.py) and
-                # flows into FL-round SubWorkflows via the shared
-                # transformation catalog.
-                memory = "8 GB" if (gpus or cfg["container"] == "train") \
-                    else "2 GB"
-                cores = min(cores, 2)
+            if cap_gb:
+                # Cap requests so jobs match small-RAM pools (the FABRIC
+                # slice advertises ~14 GB usable per slot).
+                memory_gb = min(memory_gb, cap_gb)
+                cores = min(cores, self.args.max_job_cores)
             tx = Transformation(
                 tool_name,
                 site=exec_site_name,
                 pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
                 is_stageable=True,
                 container=containers[cfg["container"]],
-            ).add_pegasus_profile(memory=memory, cores=cores)
+            ).add_pegasus_profile(memory=f"{memory_gb} GB", cores=cores)
             if gpus:
                 tx.add_condor_profile(request_gpus=str(gpus))
-            if self.args.test and cfg["container"] in ("train", "eval"):
-                tx.add_env(FEDCAST_MODEL_SIZE="128",
-                           FEDCAST_BATCH_SIZE="1")
+                if self.args.min_gpu_memory_mb:
+                    # Pin GPU work to cards with enough VRAM for the
+                    # configured model size (RTX 6000 22.5 GB vs T4 15 GB).
+                    tx.add_profiles(
+                        Namespace.CONDOR, "requirements",
+                        f"(GPUs_GlobalMemoryMb >= "
+                        f"{self.args.min_gpu_memory_mb})",
+                    )
+            if cfg["container"] in ("train", "eval"):
+                # Model geometry travels as env so it also reaches
+                # FL-round SubWorkflow jobs via the shared catalog.
+                tx.add_env(FEDCAST_MODEL_SIZE=str(self.args.model_size),
+                           FEDCAST_BATCH_SIZE=str(self.args.batch_size))
             self.tc.add_transformations(tx)
 
         # Local bridge for sub-workflow outputs consumed by parent jobs:
@@ -913,8 +920,22 @@ Examples:
                         help="Keep every Nth 2-min MRMS frame (default: 1 = "
                              "full cadence; >1 subsamples for pilot runs)")
     parser.add_argument("--limit-train-sequences", type=int, default=None,
-                        help="PILOT ONLY: cap train/val sequences per "
-                             "client in training jobs")
+                        help="PILOT/TIMING ONLY: cap train/val sequences "
+                             "per client in training jobs")
+    parser.add_argument("--model-size", type=int, default=288,
+                        help="DGMR spatial grid; must be divisible by 32 "
+                             "(default: 288 = paper-fidelity crop of the "
+                             "300x300 window)")
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="Training batch size (default: 2)")
+    parser.add_argument("--max-job-memory-gb", type=int, default=None,
+                        help="Cap every job's memory request, for pools "
+                             "with small nodes (e.g. 12 on 15.6 GB nodes)")
+    parser.add_argument("--max-job-cores", type=int, default=2,
+                        help="Core cap applied with --max-job-memory-gb")
+    parser.add_argument("--min-gpu-memory-mb", type=int, default=None,
+                        help="Require GPUs with at least this much VRAM "
+                             "(e.g. 20000 pins to RTX 6000 over T4)")
     parser.add_argument("--fallback-test-instances", type=int, default=0,
                         help="PILOT ONLY: mct_infer falls back to N test "
                              "sequences per site when no event matches")
@@ -942,10 +963,17 @@ Examples:
         args.frame_stride = 15
         args.limit_train_sequences = 4
         args.fallback_test_instances = 2
+        args.model_size = 128
+        args.batch_size = 1
+        args.max_job_memory_gb = 8
         logger.info("PILOT MODE: %s, %d month(s), %d round(s)",
                     args.sites, args.months, args.rounds)
 
     # --- Validation ---
+    if args.model_size % 32 != 0:
+        print(f"Error: --model-size ({args.model_size}) must be divisible "
+              f"by 32 (DGMR downsamples by 32; see SPEC open question 11)")
+        sys.exit(1)
     if max(args.intervals) > args.months:
         print(f"Error: largest interval ({max(args.intervals)}) exceeds "
               f"archive length ({args.months} months)")
