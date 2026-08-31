@@ -329,6 +329,12 @@ framing.
    discarding full-CONUS files immediately) so only 7 × 300×300 subdomain archives
    persist. Decide whether the cropped archive (~hundreds of GB) lives on the
    submit host, a shared FS, or S3-compatible staging.
+   **Partially resolved (2026-08-31):** the FL-chain side is fixed — each round's
+   ~582 MB global model must be staged to the output site (the next round's
+   runtime planning locates it there), so `cleanup_file` (/bin/rm) jobs now
+   delete superseded chain artifacts incrementally with a two-round rescue-safe
+   window; per-chain high-water mark is ~2.3 GB instead of ~58 GB (~14 GB total
+   for E1 instead of ~700 GB). The cropped-archive placement question remains.
 9. **DGMR hyperparameters beyond the cited defaults.** The paper defers to the
    openclimatefix implementation + Lightning defaults; those defaults have changed
    across releases. Pin exact package versions (and record them in the containers)

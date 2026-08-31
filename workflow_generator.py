@@ -259,6 +259,13 @@ class FedCastWorkflow:
             Transformation("collect_file", site="local", pfn="/bin/cp",
                            is_stageable=False)
         )
+        # Incremental deletion of superseded FL-chain artifacts on the
+        # output site (each round's 582 MB global model would otherwise
+        # accumulate — ~700 GB at full scale; SPEC open question 8).
+        self.tc.add_transformations(
+            Transformation("cleanup_file", site="local", pfn="/bin/rm",
+                           is_stageable=False)
+        )
 
     # ------------------------------------------------------------------
     # Replica Catalog — no pre-staged data inputs (everything is fetched
@@ -564,6 +571,28 @@ class FedCastWorkflow:
         sub_best_lfn = f"{method}_L{interval}_best_sub.ckpt"
         last_subwf = None
 
+        # Chained artifacts accumulate on the output site (the next
+        # round's runtime planning locates them there), so superseded
+        # ones are deleted incrementally with a two-round safety window:
+        # a rescue replan of round r+1 needs at most round r's global.
+        global_chain = []   # global-model LFNs in round order
+        val_chain = []      # (history_lfn, bestsofar_lfn) per val round
+        cleaned = set()
+
+        def add_cleanup(tag, targets, parent_job):
+            targets = [t for t in targets if t not in cleaned]
+            if not targets:
+                return
+            job = Job("cleanup_file",
+                      _id=f"clean_{method}_L{interval}_{tag}",
+                      node_label=f"clean_{method}_L{interval}_{tag}")
+            job.add_args("-f", *[
+                os.path.join(self.local_storage_dir, t) for t in targets
+            ])
+            self.wf.add_jobs(job)
+            self.wf.add_dependency(job, parents=[parent_job])
+            cleaned.update(targets)
+
         limit = getattr(self.args, "limit_train_sequences", None)
         for r in range(rounds):
             is_final = r == rounds - 1
@@ -621,6 +650,16 @@ class FedCastWorkflow:
             last_subwf = subwf
             prev_global = names["global_out"]
 
+            global_chain.append(names["global_out"])
+            if is_validation:
+                val_chain.append((names["history_out"],
+                                  names["best_out"]))
+                # Keep the last two of each chain; delete anything older.
+                stale = list(global_chain[:-2])
+                for hist, best in val_chain[:-2]:
+                    stale.extend([hist, best])
+                add_cleanup(f"r{r:03d}", stale, subwf)
+
         best_ckpt = File(f"{method}_L{interval}_best.ckpt")
         collect_job = (
             Job("collect_file",
@@ -634,6 +673,15 @@ class FedCastWorkflow:
         # No declared file input (the source is an absolute output-site
         # path), so the ordering edge must be explicit.
         self.wf.add_dependency(collect_job, parents=[last_subwf])
+
+        # Once the canonical best checkpoint is collected, every chained
+        # artifact except the final history JSON is superseded.
+        final_stale = list(global_chain) + [sub_best_lfn]
+        for hist, best in val_chain:
+            final_stale.append(best)
+        for hist, best in val_chain[:-1]:
+            final_stale.append(hist)
+        add_cleanup("final", final_stale, collect_job)
 
         self.best_ckpts[(method, interval)] = best_ckpt
 
