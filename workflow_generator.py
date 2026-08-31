@@ -596,6 +596,8 @@ class FedCastWorkflow:
             job.add_args("-f", *[
                 os.path.join(self.local_storage_dir, t) for t in targets
             ])
+            # Operates on the submit host's output directory.
+            job.add_profiles(Namespace.SELECTOR, "execution.site", "local")
             self.wf.add_jobs(job)
             self.wf.add_dependency(job, parents=[parent_job])
             cleaned.update(targets)
@@ -675,6 +677,8 @@ class FedCastWorkflow:
             .add_args(os.path.join(self.local_storage_dir, sub_best_lfn),
                       best_ckpt)
             .add_outputs(best_ckpt, stage_out=True, register_replica=False)
+            # Reads the sub-workflow's staged output on the submit host.
+            .add_profiles(Namespace.SELECTOR, "execution.site", "local")
         )
         self.wf.add_jobs(collect_job)
         # No declared file input (the source is an absolute output-site
