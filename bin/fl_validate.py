@@ -11,6 +11,15 @@ Runs inside the FL-round SubWorkflow on validation rounds only (every
 --validate-every rounds, plus the final round). With --final-best the best
 weights are additionally written in the {"state_dict":..., "history":...}
 format consumed by mct_infer.py.
+
+Two data paths, same number:
+  --client SITE:seq:manifest   emulated mode — this job loads every
+                               client's validation split itself.
+  --client-metrics FILE        cross-silo mode — each client already
+                               scored the global model at its own silo
+                               (fl_validate_client.py) and shipped only
+                               these small JSON files; the server never
+                               reads client sequences.
 """
 
 import argparse
@@ -20,6 +29,7 @@ import os
 import sys
 
 sys.path.insert(0, os.getcwd())  # fedcast_common.py staged into job cwd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # direct runs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,8 +42,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validate global model, chain best checkpoint")
     parser.add_argument("--round", type=int, required=True)
-    parser.add_argument("--client", action="append", required=True,
-                        help="SITE:sequences_lfn:manifest_lfn (repeatable)")
+    parser.add_argument("--client", action="append", default=[],
+                        help="SITE:sequences_lfn:manifest_lfn (repeatable; "
+                             "emulated mode)")
+    parser.add_argument("--client-metrics", action="append", default=[],
+                        help="Per-client validation metrics JSON from "
+                             "fl_validate_client.py (repeatable; "
+                             "cross-silo mode)")
     parser.add_argument("--interval-months", type=int, required=True)
     parser.add_argument("--archive-start", required=True, help="YYYY-MM")
     parser.add_argument("--archive-months", type=int, required=True)
@@ -48,6 +63,10 @@ def main():
                              "mct_infer format (final round only)")
     args = parser.parse_args()
 
+    if bool(args.client) == bool(args.client_metrics):
+        parser.error("pass either --client (emulated mode) or "
+                     "--client-metrics (cross-silo mode), not both/neither")
+
     import torch
 
     import fedcast_common as fc
@@ -56,19 +75,36 @@ def main():
         history = json.load(f)
     best = torch.load(args.best_in, map_location="cpu")
 
-    clients = [fc.parse_client(c) for c in args.client]
-    t_start = fc.interval_start_epoch(args.archive_start,
-                                      args.archive_months,
-                                      args.interval_months)
-    data = [fc.load_client_data(c, t_start,
-                                limit=args.limit_train_sequences)
-            for c in clients]
-
     global_state = torch.load(args.global_model, map_location="cpu")
-    model = fc.build_model(history.get("seed", 42))
-    model.load_state_dict(global_state)
 
-    val = fc.generator_val_loss(model, data)
+    if args.client_metrics:
+        # Cross-silo: clients scored the model at their own silos and
+        # sent back batch-loss sums only. No client data is read here.
+        per_client = []
+        for path in args.client_metrics:
+            with open(path) as f:
+                per_client.append(json.load(f))
+        val = fc.combine_client_val_metrics(per_client)
+        history.setdefault("client_val", []).append(
+            {"unit": args.round + 1,
+             "clients": [{"site": m.get("site"), "n_val": m.get("n_val"),
+                          "mean_loss": m.get("mean_loss")}
+                         for m in per_client]})
+        logger.info("Combined %d per-client validation reports",
+                    len(per_client))
+    else:
+        clients = [fc.parse_client(c) for c in args.client]
+        t_start = fc.interval_start_epoch(args.archive_start,
+                                          args.archive_months,
+                                          args.interval_months)
+        data = [fc.load_client_data(c, t_start,
+                                    limit=args.limit_train_sequences)
+                for c in clients]
+        model = fc.build_model(history.get("seed", 42))
+        model.load_state_dict(global_state)
+        if torch.cuda.is_available():
+            model = model.cuda()
+        val = fc.generator_val_loss(model, data)
     unit = args.round + 1  # 1-indexed round count, mirroring epochs
     history["val_points"].append({"unit": unit, "val_loss": val})
     logger.info("Round %d (unit %d): generator val loss %.6f",

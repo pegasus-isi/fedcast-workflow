@@ -21,19 +21,41 @@ Outputs:
 
 import argparse
 import hashlib
-import json
 import logging
+import os
+import shutil
 import sys
 import time
 
 import numpy as np
 from netCDF4 import Dataset
 
+sys.path.insert(0, os.getcwd())  # fedcast_common.py staged into job cwd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # direct runs
+import fedcast_common as fc  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Everything the manifest may carry off a silo. Enforced at run time by
+# fedcast_common.check_export and checked against README's "What actually
+# leaves a silo" table by tools/check_export_docs.py.
+EXPORT_FIELDS = (
+    "site", "retained",
+    "splits", "splits.train", "splits.val", "splits.test",
+    "filter", "filter.rain_threshold_mmh", "filter.min_rain_fraction",
+    "effective_cadence_s", "val_seed",
+    "retention_stats", "retention_stats.candidates",
+    "retention_stats.gap_rejected", "retention_stats.rain_rejected",
+    "sequence_sha256",
+    "silo", "silo.configured_dir", "silo.resolved_path", "silo.host",
+    "silo.user", "silo.home",
+    "start_epochs", "split_labels",
+    "error",          # the no-usable-input manifest below
+)
 
 SEQ_LEN = 16
 NOMINAL_CADENCE_S = 120  # 2-minute nominal cadence (paper)
@@ -99,6 +121,24 @@ def scan_buffer(times, frames, cadence_s, tol, thr, min_frac,
     return i
 
 
+def _silo_provenance(silo_dir, seq_path):
+    """Where the shard landed and which identity resolved that path."""
+    if not silo_dir:
+        return None
+    import getpass
+    import socket
+
+    try:
+        user = getpass.getuser()
+    except Exception:                                   # noqa: BLE001
+        user = os.environ.get("USER", "unknown")
+    return {"configured_dir": silo_dir,
+            "resolved_path": seq_path,
+            "host": socket.gethostname(),
+            "user": user,
+            "home": os.path.expanduser("~")}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build 16-frame sequences and splits for one site")
@@ -113,7 +153,42 @@ def main():
     parser.add_argument("--chunk-frames", type=int, default=512,
                         help="Frames read per streaming block (default: "
                              "512 ~ 184 MB at 300x300 float32)")
+    parser.add_argument("--silo-dir", default=None,
+                        help="CROSS-SILO MODE: write this client's shard "
+                             "into this on-worker directory and leave it "
+                             "there. The sequence file is then not a "
+                             "Pegasus output, so federated training reads "
+                             "it in place instead of staging it.")
     args = parser.parse_args()
+
+    # Registered before any work: the exit-time guard then covers this
+    # output whatever ends up writing it.
+    fc.guard_export(args.output_manifest, EXPORT_FIELDS, "manifest")
+
+    # In silo mode the shard is resident: sequences go only to the silo,
+    # and the manifest is written both there (for the client jobs) and in
+    # the job sandbox (staged out as a validation artifact).
+    seq_path = args.output_sequences
+    resident_manifest = None
+    if args.silo_dir:
+        # May be home-relative; Pegasus does not expand job arguments.
+        silo_dir = os.path.expanduser(args.silo_dir)
+        try:
+            os.makedirs(silo_dir, exist_ok=True)
+        except OSError as exc:
+            logger.error("Cannot create the silo directory %s: %s",
+                         silo_dir, exc)
+            logger.error(
+                "The shard directory must be writable by the job on this "
+                "worker. If data_dir in the silo map is an absolute path, "
+                "run 'sudo tools/silo_worker_setup.sh <silos>' here; a "
+                "home-relative data_dir needs no setup.")
+            sys.exit(1)
+        seq_path = os.path.join(
+            silo_dir, os.path.basename(args.output_sequences))
+        resident_manifest = os.path.join(
+            silo_dir, os.path.basename(args.output_manifest))
+        logger.info("Silo mode: shard stays at %s", silo_dir)
 
     # -- Pass 1: time vectors only (cheap) — order months, infer cadence ----
     month_times = {}
@@ -132,12 +207,17 @@ def main():
     if not month_times:
         logger.error("No usable input months for %s", args.site)
         # Write declared outputs before failing (SPEC constraint 17).
-        np.savez_compressed(args.output_sequences,
+        np.savez_compressed(seq_path,
                             sequences=np.zeros((0,), dtype=np.float16),
                             start_epoch=np.zeros((0,)),
                             split=np.zeros((0,), dtype=np.int8))
-        with open(args.output_manifest, "w") as f:
-            json.dump({"site": args.site, "error": "no input data"}, f)
+        # Named rather than inline so tools/check_export_docs.py can see
+        # this payload too: it is a manifest that leaves the silo.
+        error_manifest = {"site": args.site, "error": "no input data"}
+        fc.write_export(args.output_manifest, error_manifest,
+                        EXPORT_FIELDS, "error_manifest")
+        if resident_manifest:
+            shutil.copyfile(args.output_manifest, resident_manifest)
         sys.exit(1)
 
     ordered = sorted(month_times, key=lambda p: float(month_times[p][0]))
@@ -211,7 +291,7 @@ def main():
     val_idx = rng.choice(remainder, size=n_val, replace=False)
     split[val_idx] = 1  # val
 
-    np.savez_compressed(args.output_sequences, sequences=seq_arr,
+    np.savez_compressed(seq_path, sequences=seq_arr,
                         start_epoch=start_arr, split=split)
 
     digest = hashlib.sha256(seq_arr.tobytes()).hexdigest()
@@ -227,11 +307,17 @@ def main():
         "val_seed": args.val_seed,
         "retention_stats": stats,
         "sequence_sha256": digest,
+        # Records where the shard actually landed and which identity
+        # resolved that path, so a later job that resolves a
+        # home-relative directory differently is diagnosable.
+        "silo": _silo_provenance(args.silo_dir, seq_path),
         "start_epochs": start_arr.tolist(),
         "split_labels": split.tolist(),
     }
-    with open(args.output_manifest, "w") as f:
-        json.dump(manifest, f, indent=2)
+    fc.write_export(args.output_manifest, manifest, EXPORT_FIELDS,
+                    "manifest", indent=2)
+    if resident_manifest:
+        shutil.copyfile(args.output_manifest, resident_manifest)
 
     logger.info("%s: train=%d val=%d test=%d sha256=%s...",
                 args.site, manifest["splits"]["train"],

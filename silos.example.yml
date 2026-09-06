@@ -1,0 +1,66 @@
+# Cross-silo placement map for fedcast-workflow (used with --silos).
+#
+# Each federated client (radar site) is pinned to the HTCondor worker that
+# holds its data. Client training and per-client validation run ONLY there;
+# the shard is written once by that client's preprocess job and read in
+# place every round: the federated arm never moves a shard, returning only
+# model weights and small per-client counts and losses. The centralized
+# baseline and MCT evaluation do need all shards pooled, so each is copied
+# out once by a pinned silo_export job, and the split manifest is staged out
+# as a reproduction artifact. README.md's "Data placement" section lists
+# everything that leaves a silo.
+#
+# The defaults below need NO configuration on the workers at all:
+#   - pinning by `machine:` uses HTCondor's built-in Machine attribute, so
+#     nothing has to be advertised;
+#   - a home-relative data_dir is inside Apptainer's default mounts, so no
+#     bind is needed and the preprocess job creates the directory itself.
+# Copy this file, put your own machine names in, and run
+# `tools/silo_check.py silos.yml` to confirm the pool matches.
+
+# Where a shard lives on its silo worker.
+#
+# A home-relative path needs no worker setup: Apptainer mounts the job
+# user's home by default, so nothing is bind-mounted and the preprocess job
+# creates its own directory. It does assume every job on a worker runs as
+# the same user — a pool configured with per-slot users would resolve it
+# differently for the preprocess and training jobs. `tools/silo_check.py`
+# checks that and says so.
+#
+# An absolute path is the answer when that assumption does not hold, or
+# when shards belong somewhere administered rather than in a job user's
+# home. It is bind-mounted into the containers pool-wide, so EVERY worker
+# must have the directory (`sudo tools/silo_worker_setup.sh none <dir>`) —
+# Apptainer refuses to start when a bind source is missing.
+#
+# Do NOT use /tmp or /var/tmp. HTCondor defaults MOUNT_UNDER_SCRATCH to
+# "/tmp,/var/tmp", which makes both private to each job and deletes them
+# when the job ends, so the shard would be gone before the next round.
+data_dir: ~/.fedcast/silos
+
+# Each silo pins in one of three ways (first match wins):
+#   {machine: "<Machine>"}   HTCondor Machine name, as printed by
+#                            `condor_status -af Machine`. No worker setup.
+#   {requirements: "<expr>"} raw ClassAd expression (escape hatch, e.g. to
+#                            let a silo match any of several machines).
+#   {}                       the worker advertises this silo in the
+#                            string-list ClassAd named by `attribute`
+#                            below, which `tools/silo_worker_setup.sh
+#                            KTLX,KVNX` configures. Useful when you would
+#                            rather not hardcode hostnames.
+#
+# Several silos may share one worker — that is how seven clients fit a pool
+# with fewer than seven GPU nodes; each still reads only its own shard.
+# A silo should be a single worker, since the preprocess job writes the
+# shard to one machine and does not replicate it.
+
+attribute: FEDCAST_SILOS
+
+silos:
+  KTLX: {machine: "worker-1.example.org"}
+  KVNX: {machine: "worker-1.example.org"}
+  KBYX: {machine: "worker-2.example.org"}
+  KLGX: {machine: "worker-2.example.org"}
+  KENX: {machine: "worker-3.example.org"}
+  KBOX: {machine: "worker-3.example.org"}
+  PAHG: {machine: "worker-4.example.org"}

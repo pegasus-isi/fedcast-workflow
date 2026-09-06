@@ -3,6 +3,7 @@
 
 # Workflow generation
 pegasus-wms.api
+PyYAML
 
 # Local development / running bin/ scripts outside containers
 numpy<2

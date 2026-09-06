@@ -11,18 +11,23 @@ Runs inside an FL-round SubWorkflow, in parallel with the other clients.
 """
 
 import argparse
-import json
 import logging
 import os
 import sys
 
 sys.path.insert(0, os.getcwd())  # fedcast_common.py staged into job cwd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # direct runs
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Everything this job may send back to the (unpinned) aggregator. Enforced
+# at run time by fedcast_common.check_export and checked against README's
+# "What actually leaves a silo" table by tools/check_export_docs.py.
+EXPORT_FIELDS = ("site", "round", "n_train")
 
 
 def main():
@@ -42,6 +47,12 @@ def main():
     parser.add_argument("--local-model-out", required=True)
     parser.add_argument("--meta-out", required=True)
     args = parser.parse_args()
+
+    import fedcast_common as fc
+
+    # Registered before any work: the exit-time guard then covers this
+    # output whatever ends up writing it.
+    fc.guard_export(args.meta_out, EXPORT_FIELDS, "meta")
 
     import torch
 
@@ -65,8 +76,7 @@ def main():
                        "global model through", client["name"])
         state = torch.load(args.global_model, map_location="cpu")
         torch.save(state, args.local_model_out)
-        with open(args.meta_out, "w") as f:
-            json.dump(meta, f)
+        fc.write_export(args.meta_out, meta, EXPORT_FIELDS, "meta")
         return
 
     # Deterministic per-(round, client) seed.
@@ -78,8 +88,7 @@ def main():
     fc.fit_one_epoch(model, fc.make_loader(*data["train"]), epochs=1)
 
     torch.save(fc.cpu_state_dict(model), args.local_model_out)
-    with open(args.meta_out, "w") as f:
-        json.dump(meta, f)
+    fc.write_export(args.meta_out, meta, EXPORT_FIELDS, "meta")
     logger.info("%s round %d: local epoch done (n_train=%d)",
                 client["name"], args.round, data["n_train"])
 

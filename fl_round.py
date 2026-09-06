@@ -10,14 +10,52 @@ Each federated round of Fed-Cast is its own sub-DAG (paper Sec. IV-C.2):
                             best-so-far checkpoint; final round emits the
                             best checkpoint in mct_infer format)
 
+Two placement models, selected by the caller through the client specs:
+
+  emulated (default)   client shards are Pegasus files staged to whatever
+                       worker HTCondor matches, and fl_validate scores all
+                       clients' validation splits itself. Faithful to the
+                       paper, which emulates federation from a common MRMS
+                       archive (paper Sec. III-B, Fig. 1 caption).
+
+  cross-silo (--silos) each client dict carries a "requirements" ClassAd
+                       expression and absolute on-worker paths. The shard
+                       is never staged: the training job is pinned to the
+                       silo holding it and reads it in place, and
+                       validation fans out to pinned fl_validate_client
+                       jobs that return per-client loss sums and counts.
+                       Nothing in this sub-workflow moves a shard, though
+                       each client does return small aggregates derived
+                       from its data (n_train from training, n_val /
+                       n_batches / losses from validation). The pooled
+                       arms outside it get one silo_export copy per
+                       client. See "Data placement" in README.md for the
+                       full list of what leaves a silo.
+
 Imported by workflow_generator.py, which writes the returned Workflow to a
 YAML file, registers it in the replica catalog, and adds a SubWorkflow job
 per round to the top-level DAG.
 """
 
-from Pegasus.api import File, Job, Workflow
+from Pegasus.api import File, Job, Namespace, Workflow
 
 COMMON_LFN = "fedcast_common.py"
+
+
+def _place_client_job(job, client):
+    """Pin a client job to its silo, or leave it free-floating.
+
+    In cross-silo mode the client's shard is resident on the silo worker,
+    so the job carries an HTCondor requirements expression instead of
+    declaring the shard as a staged input. In emulated mode the shard is
+    a normal Pegasus file and is declared as an input here.
+    """
+    if client.get("requirements"):
+        job.add_profiles(Namespace.CONDOR, "requirements",
+                         client["requirements"])
+    else:
+        job.add_inputs(File(client["sequences"]),
+                       File(client["manifest"]))
 
 
 def round_file_names(method, interval, round_num):
@@ -44,7 +82,7 @@ def generate_round_workflow(
     method,
     interval,
     round_num,
-    clients,            # list of {"name", "sequences", "manifest"} LFN dicts
+    clients,            # list of client specs; see _client_specs()
     prev_global_lfn,
     prev_history_lfn,
     prev_best_lfn,
@@ -87,8 +125,6 @@ def generate_round_workflow(
             f"{method}_L{interval}_r{round_num:03d}_local_{site}.pt")
         meta = File(
             f"{method}_L{interval}_r{round_num:03d}_meta_{site}.json")
-        seq_f = File(client["sequences"])
-        man_f = File(client["manifest"])
         job = (
             Job("fl_train_client",
                 _id=f"train_{site}",
@@ -105,11 +141,12 @@ def generate_round_workflow(
                 "--local-model-out", local_model,
                 "--meta-out", meta,
             )
-            .add_inputs(global_in, seq_f, man_f, common)
+            .add_inputs(global_in, common)
             .add_outputs(local_model, stage_out=False,
                          register_replica=False)
             .add_outputs(meta, stage_out=False, register_replica=False)
         )
+        _place_client_job(job, client)
         wf.add_jobs(job)
         train_jobs.append(job)
         local_models.append(local_model)
@@ -160,20 +197,51 @@ def generate_round_workflow(
                          register_replica=False)
             .add_outputs(best_out, stage_out=True, register_replica=False)
         )
+        val_client_jobs = []
         for client in clients:
-            val_job.add_args(
-                "--client",
-                f"{client['name']}:{client['sequences']}"
-                f":{client['manifest']}",
+            if not client.get("requirements"):
+                # Emulated: the server reads this client's split itself.
+                val_job.add_args(
+                    "--client",
+                    f"{client['name']}:{client['sequences']}"
+                    f":{client['manifest']}",
+                )
+                val_job.add_inputs(File(client["sequences"]),
+                                   File(client["manifest"]))
+                continue
+            # Cross-silo: score at the silo, ship metrics only.
+            csite = client["name"]
+            cmetrics = File(
+                f"{method}_L{interval}_r{round_num:03d}_val_{csite}.json")
+            cjob = (
+                Job("fl_validate_client",
+                    _id=f"valclient_{csite}",
+                    node_label=f"valclient_{csite}_r{round_num:03d}")
+                .add_args(
+                    "--client",
+                    f"{csite}:{client['sequences']}:{client['manifest']}",
+                    "--round", str(round_num),
+                    *interval_args,
+                    *pilot_args,
+                    "--global-model", global_out,
+                    "--metrics-out", cmetrics,
+                )
+                .add_inputs(global_out, common)
+                .add_outputs(cmetrics, stage_out=False,
+                             register_replica=False)
             )
-            val_job.add_inputs(File(client["sequences"]),
-                               File(client["manifest"]))
+            _place_client_job(cjob, client)
+            wf.add_jobs(cjob)
+            wf.add_dependency(cjob, parents=[agg_job])
+            val_client_jobs.append(cjob)
+            val_job.add_args("--client-metrics", cmetrics)
+            val_job.add_inputs(cmetrics)
         if final_best_lfn:
             final_best = File(final_best_lfn)
             val_job.add_args("--final-best", final_best)
             val_job.add_outputs(final_best, stage_out=True,
                                 register_replica=False)
         wf.add_jobs(val_job)
-        wf.add_dependency(val_job, parents=[agg_job])
+        wf.add_dependency(val_job, parents=[agg_job, *val_client_jobs])
 
     return wf, names

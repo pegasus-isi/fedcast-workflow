@@ -15,6 +15,7 @@ import os
 import sys
 
 sys.path.insert(0, os.getcwd())  # fedcast_common.py staged into job cwd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # direct runs
 
 logging.basicConfig(
     level=logging.INFO,

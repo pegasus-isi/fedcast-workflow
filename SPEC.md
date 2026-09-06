@@ -55,7 +55,11 @@ Phase C — Training (per L; GPU jobs)
                                     # validate every 5 rounds, same checkpoint rule;
                                     # ONE SubWorkflow PER ROUND (fl_round.py): per-client
                                     # fan-out → fl_aggregate → fl_validate, chained via
-                                    # the global-model file
+                                    # the global-model file.
+                                    # With --silos (Q12): client jobs are pinned to the
+                                    # worker holding their shard and read it in place,
+                                    # and validation fans out to fl_validate_client at
+                                    # the silos, which return batch-loss sums only
   (STEPS requires no training — it runs at inference time in Phase D)
 
 Phase D — Evaluation via MCT (per method × L × event)
@@ -73,40 +77,67 @@ Phase E — Ablations (reuse Phases A/B/D)
   E2.2: train_centralized_sam(L, ρ)    # generator-side SAM, ρ ∈ {0.025, 0.0125}
 ```
 
+The step names above are the design's, not the implementation's: A1–A5 are fused
+into one `fetch_crop_mrms` job per (domain, month) so full-CONUS files are never
+persisted (open question 8), and the fetch fans out per domain rather than per
+site because one download serves every site in that domain. See §1.2 for the
+jobs as built.
+
 Phase A fans out per (site, month) and is independent across sites; Phase C depends
 on all Phase A outputs for the sites/months inside its interval `L`; Phase D depends
 on Phase B and the relevant Phase C checkpoint. Ablations are separate sub-DAGs
 gated on E1 completion (they reuse E1 data and benchmark artifacts).
 
-### 1.2 Repository layout (per repo conventions)
+### 1.2 Repository layout (as built)
 
 ```
 fedcast-workflow/
 ├── workflow_generator.py      # Pegasus DAG generator (Pegasus.api)
-├── bin/
-│   ├── fetch_mrms.py          # S3 fetch wrapper (retry + fail-loud, see §2)
-│   ├── grib2_to_netcdf.py
-│   ├── crop_subdomain.py
-│   ├── preprocess_sequences.py
+├── fl_round.py                # builder for one FL-round SubWorkflow
+├── silos.example.yml          # cross-silo placement map template (§6 Q12)
+├── bin/                       # job wrappers, staged to the workers
+│   ├── fedcast_common.py      # shared model/data helpers for the fl_* jobs
+│   ├── fetch_crop_mrms.py     # S3 fetch + crop-on-ingest, one job per
+│   │                          # (domain, month); fuses planned A1-A4
+│   ├── preprocess_sequences.py  # sequences, rain filter, frozen split,
+│   │                          # manifest; --silo-dir keeps the shard resident
 │   ├── fetch_events.py        # MPD / LSR / StormEvents (best-effort per source)
-│   ├── build_benchmark.py
-│   ├── train_centralized.py   # PyTorch Lightning DGMR (openclimatefix impl)
-│   ├── train_federated.py     # Flower simulation driver
-│   ├── mct_infer.py           # forecast adapters: DGMR / PySTEPS / persistence
+│   ├── build_benchmark.py     # balanced event selection → benchmark set B
+│   ├── train_dgmr.py          # centralized DGMR segment job (Lightning)
+│   ├── fl_init.py             # seeds the global model for an FL chain
+│   ├── fl_train_client.py     # one client's local epoch for one round
+│   ├── fl_aggregate.py        # FedAvg, uniform or quadratic weights
+│   ├── fl_validate.py         # chained history + best-so-far checkpoint
+│   ├── fl_validate_client.py  # cross-silo: score at the silo, return metrics
+│   ├── silo_export.sh         # cross-silo: shard egress for the pooled arms
+│   ├── mct_infer.py           # forecast adapters: DGMR / PySTEPS
 │   ├── mct_verify.py          # metric computation
-│   └── topsis.py              # TOPSIS per Eq. 5–6 (no clipping / no ε-stabilization)
-├── Docker/
-│   ├── Dockerfile.data        # wgrib2/eccodes, xarray, boto3
-│   ├── Dockerfile.train       # CUDA + PyTorch Lightning + Flower + DGMR
-│   └── Dockerfile.eval        # PySTEPS, TorchMetrics, METplus (optional), pandas
-├── requirements.txt
+│   ├── mct_topsis.py          # TOPSIS per Eq. 5-6 (no clipping / no epsilon)
+│   ├── make_figures.py
+│   └── validate_report.py     # tiered reproduction gates (§5)
+├── tools/                     # submit-host helpers, not workflow jobs
+│   ├── check_export_docs.py   # fails if a silo job exports an undocumented field
+│   ├── silo_check.py          # cross-silo preflight (placement + durability)
+│   ├── silo_worker_setup.sh   # worker prep, only for non-default silo maps
+│   └── timing_extrapolate.py  # project full-study wall-clock from a run dir
+├── Apptainer/                 # FedCast_{data,train,eval}.def
+├── run_manual.sh              # tiny end-to-end smoke test without Pegasus
+├── requirements.txt           # submit-host only; job deps live in the images
 ├── SPEC.md                    # this file
 ├── PAPER_SUMMARY.md
 └── README.md
 ```
 
-Container images published to Docker Hub under `kthare10/` (e.g.
-`kthare10/fedcast-data`, `kthare10/fedcast-train`, `kthare10/fedcast-eval`).
+Generated and gitignored: `workflow.yml`, the catalogs (`sites.yml`,
+`transformations.yml`, `replicas.yml`), `pegasus.properties`, the FL-round
+sub-workflow files (`fl_rounds/`, `fl_subwf.properties`, `fl_subwf_rc.yml`),
+and the `scratch/` and `output/` directories. All are written relative to the
+directory the generator runs in, so nothing in the repository hard-codes a
+host or a path.
+
+Containers are built locally from `Apptainer/*.def` into `Apptainer/*.sif`
+(gitignored — several GB each) rather than pulled from a registry, so the
+image the jobs run is the one on the submit host.
 
 ---
 
@@ -178,9 +209,12 @@ Container images published to Docker Hub under `kthare10/` (e.g.
    in epochs/rounds, not hardware. Any CUDA-capable site (Chameleon, FABRIC, local
    HTCondor pool) is acceptable.
 2. **Geographic distribution of clients.** The paper itself *emulates* federation
-   from a common MRMS archive; running all 7 Flower clients as a simulation on one
-   GPU node is faithful. True multi-site deployment is a stretch goal, not a
-   requirement.
+   from a common MRMS archive (Sec. III-B; Fig. 1's caption states the server icon
+   "denotes a server-side role, not an actual deployment location"), so running all
+   7 clients on shared GPU nodes is faithful and remains the default.
+   **IMPLEMENTED (2026-09-05) as an option beyond the paper:** `--silos <map>`
+   pins each client's data and jobs to the worker holding its shard, so no client
+   data is staged for the federated arm — see open question 12.
 3. **MCT as a software artifact.** MCT is not publicly released (as of Aug 2026); we
    reimplement its *behavior* (adapters → fixed benchmark → per-lead metrics →
    TOPSIS) from the paper's specification rather than reuse its code.
@@ -315,8 +349,9 @@ framing.
    the global-model file. Centralized training keeps checkpointed segment chains
    (b) — it has no client structure to express. Trade-offs accepted: ~100 sub-DAG
    plannings per (method, L) and per-round staging of the global model and client
-   sequence files; gained: per-client job placement (true multi-site federation
-   becomes possible), per-round retry granularity, and per-round visibility.
+   sequence files; gained: the per-client job structure that cross-silo placement
+   later builds on (open question 12), per-round retry granularity, and per-round
+   visibility.
    Follow-up RESOLVED (2026-08-30, pilot run0004): sub-to-sub chaining works
    natively (round r+1 consumes round r's global model via runtime planning),
    but parent jobs cannot consume sub-workflow outputs directly — subs stage
@@ -355,6 +390,126 @@ framing.
     a modified architecture? *Our documented rule:* center-crop to 288×288
     (= 9×32) at the model boundary, applied identically to every method
     (including STEPS) so the evaluation grid stays uniform.
+
+12. **Client data placement.** ~~The per-round SubWorkflow structure gives each
+    client its own job, but nothing made a client's shard *stay* anywhere: shards
+    were built centrally and re-staged to whatever worker HTCondor matched, every
+    round, and `fl_validate` read every client's validation split on one node.
+    That is emulated FL, not cross-silo FL.~~ **RESOLVED (2026-09-05): both models
+    are supported, emulated by default.**
+
+    `--silos <map>` (see `silos.example.yml`) makes each client a real data holder:
+
+    - `preprocess_sequences` runs pinned to the client's silo and writes the shard
+      into an on-worker directory (`--silo-dir`). The shard is not a Pegasus file,
+      so nothing can stage it implicitly.
+    - `fl_train_client` and the new `fl_validate_client` carry the silo's HTCondor
+      requirements expression and read the resident shard in place. No federated
+      job moves the shard; what those jobs do return, besides the model weights,
+      is small per-client metadata — `n_train` from training (the aggregator
+      needs it for the Eq. 8 quadratic-weighting ablation) and
+      `n_val`/`n_batches`/loss sum and mean from validation.
+    - Validation is split: each client scores the new global model on its own split
+      at its silo and returns batch-loss sums; `fl_validate --client-metrics`
+      recombines them. `fedcast_common.combine_client_val_metrics` reconstructs
+      exactly the mean batch loss the central path computes, so constraint 9's
+      checkpoint rule is unchanged and the two modes are comparable.
+    - **The federated arm's zero-egress property does not extend to the run as a
+      whole.** The centralized baseline and MCT evaluation need shards pooled —
+      that is the thing the paper measures federation against — and every run
+      builds them, so silo mode adds an UNCONDITIONAL pinned `silo_export` job
+      per client: each shard is copied out exactly once. What the mode buys is
+      7 copies instead of 7 x rounds, and egress that is an explicit DAG node on
+      the centralized side and absent on the federated side, making the asymmetry
+      behind Eq. 7 structural rather than assumed. A run with no shard egress at
+      all would need a federated-only workflow (no centralized arm, no pooled
+      evaluation), which the generator does not currently build. The per-client
+      per-client metadata above also leaves the silo, as does the split manifest
+      — which is staged out as a Tier 0/1 reproduction artifact and is the
+      largest metadata export, carrying per-sequence `start_epochs` and
+      `split_labels` vectors (a timestamp and split label for every retained
+      sequence at that site), the shard's on-worker path and resolving identity
+      under `silo`, and `sequence_sha256`, which digests the sequence array
+      alone and so does not verify the shard file. All of it is derived from client data
+      rather than being the data, but no privacy claim is made about any of it
+      (non-constraint 8 — the paper adds no privacy mechanism either). What
+      cross-silo mode changes is the bulk movement, not every trace of the data;
+      README's "Data placement" section lists the exports in full, field by
+      field, and that list is enforced in two halves rather than maintained by
+      hand. Each wrapper declares an `EXPORT_FIELDS` tuple, and enforcement is
+      at run time in three layers: `fedcast_common.write_export()` validates
+      and writes in one call (validation recurses through nested mappings *and*
+      sequences, so a dict inside a list is covered, and an undeclared field
+      aborts before the file exists); the file is read back and validated
+      again; and `guard_export()` registers the path up front and re-validates
+      the artifact at interpreter exit, which is the layer that carries the
+      guarantee because it holds whatever wrote the file — an aliased
+      `json.dump`, a hand-rolled write, or a guarded call that proved
+      unreachable. Every export must be a JSON object: a payload replaced by a
+      bare array or scalar exposes no field names and would otherwise pass by
+      carrying nothing the check can name. The check controls field *names*
+      only — not the type or size of a declared field, which is why the
+      manifest's per-sequence `start_epochs`/`split_labels` vectors are
+      disclosed in README's table rather than left to it. Statically, `tools/check_export_docs.py` requires each field
+      in README's export section and each payload to be registered with
+      `guard_export` and written with `write_export`, both passing
+      `EXPORT_FIELDS` with payload and label in agreement. It deliberately does
+      NOT claim to prove the absence of other write paths — not decidable by
+      reading Python — and its `json.dump` detection is a lint, not a proof.
+      An earlier version of that tool tried to derive the surface by analysing
+      how each payload was built; that cannot be completed in a dynamic language
+      (successive reviews found an unresolvable name, `dict(...)` in place of a
+      literal, then post-construction mutation), which is why the authoritative
+      check now runs against the real object. `preprocess_sequences` therefore
+      takes `fedcast_common.py` as an input, which is the only DAG change: two
+      extra staged-input entries per site in the pilot.
+    - **No worker-side setup is needed for the default map.** Silos pin by
+      HTCondor's built-in `Machine` attribute (nothing to advertise, no
+      `condor_reconfig`), and the default shard directory `~/.fedcast/silos` is
+      inside the job user's home, which Apptainer mounts, so nothing is
+      bind-mounted and the preprocess job creates its own directory. Shard
+      paths therefore reach jobs unexpanded; `fedcast_common.parse_client`,
+      `preprocess_sequences.py` and `bin/silo_export.sh` expand them in the job's
+      own environment, because Pegasus does not expand job arguments. The shell
+      wrapper uses parameter substitution, never `eval` — the path comes from a
+      config file, and `eval` would execute anything in it.
+    - **The home-relative default's one assumption** is that every job on a
+      worker runs as the same user. A pool with per-slot users would resolve the
+      directory differently for the preprocess and training jobs; `silo_check.py`
+      queries `SLOT_USER` per matched worker and says so, and an absolute
+      `data_dir` is the fix. `/tmp` and `/var/tmp` are explicitly NOT usable
+      despite Apptainer mounting them: HTCondor defaults `MOUNT_UNDER_SCRATCH`
+      to `/tmp,/var/tmp`, making both private per job and deleting them at job
+      end, so a shard there would not survive to the next round. The generator
+      warns on such a `data_dir` (matching the directory itself as well as
+      anything under it) and `silo_check.py` checks it per worker, reporting a
+      worker whose config cannot be read as unverified rather than as fine —
+      with its own exit status (3, vs 1 for a real problem) so
+      `silo_check.py && pegasus-plan` is safe by default and an unchecked pool
+      is never mistaken for a clean one; `--allow-unverified` accepts it on
+      pools that refuse remote config queries. `load_silo_map` raises ValueError
+      for every way the map can be wrong (unparseable YAML, wrong top-level
+      shape, non-mapping `silos`, a non-mapping or non-string silo entry), so
+      both the generator and the preflight report a configuration mistake
+      instead of a traceback.
+      Failures are made self-diagnosing rather than mysterious: a missing shard
+      reports host, job user and `HOME`, and each manifest records the same three
+      for the preprocess job that wrote it.
+    - Two departures still need `tools/silo_worker_setup.sh`: an absolute
+      `data_dir` elsewhere (Pegasus scopes `container.arguments` to the catalog,
+      not the job, so it is bind-mounted pool-wide and EVERY worker needs it —
+      `silo_worker_setup.sh none`), and ClassAd pinning (`{}` entries). Pegasus
+      cannot own either: its own symlinking-in-containers support has the same
+      requirement that the host directory pre-exist and be named in the
+      container's `mounts`. `tools/silo_check.py` resolves every silo against
+      `condor_status` and, only when the map needs a bind, checks it pool-wide.
+
+    Deliberately out of scope: **ingest is still shared** (one fetch job per
+    (domain, month) crops for all clients in that domain, since per-silo ingest
+    multiplies a multi-TB download by the client count), and a silo is one worker
+    unless its directory is replicated by hand. Both are documented in README.md.
+    Note this exceeds the paper, which does no silo pinning of its own; the
+    reproduction claim rests on the emulated default.
 
 ---
 

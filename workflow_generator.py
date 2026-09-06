@@ -33,6 +33,7 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
 from Pegasus.api import *
 
 from fl_round import (
@@ -88,6 +89,8 @@ TOOL_CONFIGS = {
     "fl_aggregate":         {"memory": "16 GB", "cores": 2, "container": "train"},
     "fl_validate":          {"memory": "32 GB", "cores": 8, "container": "train",
                              "gpus": 1},
+    "fl_validate_client":   {"memory": "32 GB", "cores": 8, "container": "train",
+                             "gpus": 1},
     "mct_infer":            {"memory": "16 GB", "cores": 4, "container": "eval",
                              "gpus": 1},
     "mct_verify":           {"memory": "8 GB",  "cores": 4, "container": "eval"},
@@ -110,6 +113,163 @@ def month_range(start_month, n_months):
     return months
 
 
+DEFAULT_SILO_ATTRIBUTE = "FEDCAST_SILOS"
+DEFAULT_SILO_DATA_DIR = "~/.fedcast/silos"
+
+# Apptainer mounts the job user's home from the host by default, so a
+# shard kept under it needs no --bind and therefore no pre-created
+# directory on the worker: the preprocess job makes its own. Anywhere else
+# the bind is required, and Apptainer refuses to start when its source is
+# missing.
+#
+# /tmp and /var/tmp are deliberately NOT here even though Apptainer mounts
+# them too: HTCondor defaults MOUNT_UNDER_SCRATCH to "/tmp,/var/tmp", which
+# makes both private to each job and deletes them when the job ends. A
+# shard written there would be gone before the next round read it.
+AUTO_MOUNTED_PREFIXES = ("~/",)
+
+# Same reason — warn if someone points data_dir at one of these anyway.
+SCRATCH_MOUNTED_DIRS = ("/tmp", "/var/tmp")
+
+
+def under_scratch_mount(data_dir, roots=SCRATCH_MOUNTED_DIRS):
+    """The scratch-mounted root containing data_dir, or None.
+
+    Matches the directory itself as well as anything under it, so a bare
+    "/tmp" is caught alongside "/tmp/fedcast". Trailing slashes and "." or
+    ".." segments are normalized away first, since a path that only looks
+    different still resolves into the same private per-job mount.
+    """
+    if data_dir.startswith("~"):
+        return None
+    target = os.path.normpath(data_dir)
+    for root in roots:
+        root = os.path.normpath(root)
+        if target == root or target.startswith(root + os.sep):
+            return root
+    return None
+
+
+def needs_container_bind(data_dir):
+    """True if data_dir must be bind-mounted into the containers."""
+    return not data_dir.startswith(AUTO_MOUNTED_PREFIXES)
+
+
+def load_silo_map(path, sites):
+    """Parse a silo map (see silos.example.yml) into placement rules.
+
+    Returns a dict with ``data_dir`` (the on-worker root holding resident
+    shards) and ``requirements`` mapping each requested site to the
+    HTCondor requirements expression that pins its jobs to the worker
+    holding its data.
+
+    Every way the file can be wrong — unreadable, unparseable, or the
+    right YAML but the wrong shape — is raised as ValueError with a
+    message naming the file, so callers report configuration mistakes
+    rather than tracebacks.
+    """
+    try:
+        with open(path) as f:
+            doc = yaml.safe_load(f)
+    except OSError as exc:
+        # Missing, unreadable, or a directory. Raised as ValueError like
+        # every other failure here so both entry points report it the
+        # same way; see this function's contract above.
+        raise ValueError(
+            f"{path}: cannot read the silo map: {exc.strerror or exc} "
+            f"(start from silos.example.yml)"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        # A ValueError already, so it would surface without a file name.
+        raise ValueError(
+            f"{path}: not a text file ({exc.reason}) — expected YAML"
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{path}: not valid YAML: {exc}") from exc
+
+    if doc is None:
+        doc = {}
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"{path}: expected a mapping at the top level, found "
+            f"{type(doc).__name__} — see silos.example.yml"
+        )
+
+    data_dir = doc.get("data_dir", DEFAULT_SILO_DATA_DIR)
+    attribute = doc.get("attribute", DEFAULT_SILO_ATTRIBUTE)
+    for key, value in (("data_dir", data_dir), ("attribute", attribute)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"{path}: '{key}' must be a non-empty string, found "
+                f"{value!r}"
+            )
+
+    silos = doc.get("silos")
+    if silos is None:
+        silos = {}
+    if not isinstance(silos, dict):
+        raise ValueError(
+            f"{path}: 'silos' must be a mapping of site name to placement, "
+            f"found {type(silos).__name__} — see silos.example.yml"
+        )
+
+    missing = [s for s in sites if s not in silos]
+    if missing:
+        raise ValueError(
+            f"{path}: no silo defined for {', '.join(missing)} — every "
+            f"client in --sites needs an entry under 'silos:'"
+        )
+
+    requirements = {}
+    for site in sites:
+        entry = silos[site]
+        if entry is None:
+            entry = {}
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{path}: silo '{site}' must be a mapping such as "
+                f"{{machine: \"host\"}} or {{}}, found "
+                f"{type(entry).__name__}"
+            )
+        for key in ("machine", "requirements"):
+            if key in entry and not isinstance(entry[key], str):
+                raise ValueError(
+                    f"{path}: silo '{site}' has a non-string '{key}': "
+                    f"{entry[key]!r}"
+                )
+        if entry.get("requirements"):
+            expr = entry["requirements"]
+        elif entry.get("machine"):
+            expr = f'(Machine == "{entry["machine"]}")'
+        else:
+            # Worker advertises its hosted silos as a comma-separated
+            # string in `attribute` (tools/silo_worker_setup.sh).
+            # stringListMember matches whole entries, so silo "KTLX"
+            # never matches a worker hosting only "KTLXX", and the
+            # =?= keeps the expression False (not undefined) on workers
+            # that do not advertise the attribute at all.
+            expr = (f'(stringListMember("{site}", '
+                    f'{attribute}) =?= True)')
+        requirements[site] = expr
+
+    scratch_root = under_scratch_mount(data_dir)
+    if scratch_root:
+        logger.warning(
+            "%s: data_dir %s is %s, which HTCondor makes private per job by "
+            "default (MOUNT_UNDER_SCRATCH=/tmp,/var/tmp). Each job would "
+            "get its own empty copy and the shard would be deleted when "
+            "the preprocess job ends. Use a home-relative path, or an "
+            "absolute path outside /tmp and /var/tmp with "
+            "tools/silo_worker_setup.sh.", path, data_dir,
+            "in " + scratch_root if os.path.normpath(data_dir) != scratch_root
+            else scratch_root + " itself")
+
+    return {"data_dir": data_dir, "attribute": attribute,
+            "requirements": requirements, "path": os.path.abspath(path),
+            "needs_bind": needs_container_bind(data_dir),
+            "home_relative": data_dir.startswith("~")}
+
+
 class FedCastWorkflow:
     """Fed-Cast reproduction workflow (see SPEC.md)."""
 
@@ -129,12 +289,20 @@ class FedCastWorkflow:
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
 
         self.sites = args.sites
+        # Cross-silo placement map (None = emulated placement, the paper's
+        # own model: clients reconstructed from one central MRMS archive).
+        self.silos = (load_silo_map(args.silos, args.sites)
+                      if args.silos else None)
         self.months = month_range(args.start_month, args.months)
         self.intervals = sorted(args.intervals)
         self.experiments = args.experiments
 
         # Per-site sequence/manifest files shared across phases.
         self.site_files = {}
+        # Per-site preprocess jobs, for explicit ordering edges in silo
+        # mode (where shards are not declared files, so Pegasus cannot
+        # infer the dependency).
+        self.prep_jobs = {}
         # Per-method best checkpoints: {(method, L): File}
         self.best_ckpts = {}
         # Benchmark file shared between Phase B and D.
@@ -147,6 +315,23 @@ class FedCastWorkflow:
         # Path to the sub-workflow planning properties (set by
         # write_subworkflow_conf()).
         self.subwf_conf = None
+
+    def log_placement(self):
+        """Say how client data will be placed, and what that assumes."""
+        if not self.silos:
+            return
+        logger.info(f"Shard directory: {self.silos['data_dir']}")
+        if self.silos["needs_bind"]:
+            logger.info(
+                "  bind-mounted pool-wide — every worker needs this "
+                "directory (tools/silo_worker_setup.sh none)")
+        else:
+            logger.info(
+                "  inside the job user's home, which Apptainer mounts — "
+                "no bind, no worker setup needed")
+            logger.info(
+                "  assumes every job on a worker runs as the same user; "
+                "tools/silo_check.py flags pools where it does not")
 
     def write(self):
         if self.sc is not None:
@@ -217,11 +402,24 @@ class FedCastWorkflow:
                 ),
                 image_site="local",
             )
+            cargs = []
             if name in ("train", "eval"):
                 # Expose host GPUs inside Apptainer (harmless warning on
                 # CPU-only nodes).
+                cargs.append("--nv")
+            if (self.silos and self.silos["needs_bind"]
+                    and name in ("data", "train")):
+                # Shards outside Apptainer's default mounts have to be
+                # bound in, and container.arguments is catalog-scope, so
+                # this bind applies to every job using the container —
+                # including unpinned ones on workers that hold no data.
+                # Each of those workers therefore needs the directory to
+                # exist (tools/silo_worker_setup.sh none). A home- or
+                # tmp-relative data_dir avoids all of this.
+                cargs.append(f"--bind {self.silos['data_dir']}")
+            if cargs:
                 containers[name].add_pegasus_profile(
-                    container_arguments="--nv")
+                    container_arguments=" ".join(cargs))
         self.tc.add_containers(*containers.values())
 
         cap_gb = self.args.max_job_memory_gb
@@ -266,6 +464,21 @@ class FedCastWorkflow:
             Transformation("collect_file", site="local", pfn="/bin/cp",
                            is_stageable=False)
         )
+        if self.silos:
+            # Explicit egress boundary: copies a resident shard out of its
+            # silo into Pegasus staging for the pooled consumers (the
+            # centralized baseline and MCT evaluation). The federated arm
+            # never uses this path — that asymmetry is the point of the
+            # paper's communication-volume comparison (Sec. V, Eq. 7).
+            # Staged shell script rather than /bin/cp: it expands a
+            # home-relative shard path, which Pegasus does not do for
+            # job arguments, and reports a missing shard clearly.
+            self.tc.add_transformations(
+                Transformation("silo_export", site=exec_site_name,
+                               pfn=os.path.join(self.wf_dir,
+                                                "bin/silo_export.sh"),
+                               is_stageable=True)
+            )
         # Incremental deletion of superseded FL-chain artifacts on the
         # output site (each round's 582 MB global model would otherwise
         # accumulate — ~700 GB at full scale; SPEC open question 8).
@@ -391,9 +604,9 @@ class FedCastWorkflow:
                     "--rain-threshold", str(self.args.rain_threshold),
                     "--min-rain-fraction", str(self.args.min_rain_fraction),
                 )
-                .add_inputs(*month_files)
-                .add_outputs(sequences, stage_out=False,
-                             register_replica=False)
+                # fedcast_common provides the export-surface check the
+                # wrapper runs before writing its manifest.
+                .add_inputs(*month_files, File(COMMON_LFN))
                 # Manifests are validation artifacts (SPEC Tier 0/1).
                 .add_outputs(manifest, stage_out=True,
                              register_replica=False)
@@ -401,11 +614,59 @@ class FedCastWorkflow:
             )
             for f in month_files:
                 prep_job.add_args("--input", f)
-            self.wf.add_jobs(prep_job)
 
+            if self.silos:
+                # Cross-silo: build the shard ON the silo that owns this
+                # client and leave it there. It is not a Pegasus output,
+                # so no federated job ever stages it off the worker.
+                silo_dir = self.silo_paths(site)["dir"]
+                prep_job.add_args("--silo-dir", silo_dir)
+                prep_job.add_profiles(
+                    Namespace.CONDOR, "requirements",
+                    self._silo_requirements(site))
+                self.wf.add_jobs(prep_job)
+                self._add_silo_export(site, sequences, prep_job)
+            else:
+                prep_job.add_outputs(sequences, stage_out=False,
+                                     register_replica=False)
+                self.wf.add_jobs(prep_job)
+
+            self.prep_jobs[site] = prep_job
             self.site_files[site] = {
                 "sequences": sequences, "manifest": manifest
             }
+
+    def silo_paths(self, site):
+        """Resident (on-worker) paths for one client's shard."""
+        silo_dir = os.path.join(self.silos["data_dir"], site)
+        return {
+            "dir": silo_dir,
+            "sequences": os.path.join(silo_dir, f"{site}_sequences.npz"),
+            "manifest": os.path.join(silo_dir, f"{site}_manifest.json"),
+        }
+
+    def _add_silo_export(self, site, sequences, prep_job):
+        """Copy a resident shard out of its silo for the pooled arms.
+
+        The centralized baseline trains on all seven shards pooled, and
+        MCT evaluation is a server-side step, so both need the data
+        centrally — that is what the paper compares federation against.
+        Making the egress its own pinned DAG node keeps the asymmetry
+        visible and countable: the federated arm has no such node.
+        """
+        job = (
+            Job("silo_export",
+                _id=f"export_{site}", node_label=f"export_{site}")
+            .add_args(self.silo_paths(site)["sequences"], sequences)
+            .add_outputs(sequences, stage_out=False, register_replica=False)
+            .add_profiles(Namespace.CONDOR, "requirements",
+                          self._silo_requirements(site))
+            .add_pegasus_profiles(label=site)
+        )
+        self.wf.add_jobs(job)
+        # The source is an absolute on-worker path, not a declared file
+        # input, so the ordering edge must be explicit.
+        self.wf.add_dependency(job, parents=[prep_job])
 
     # -- Phase B: event benchmark ---------------------------------------
     def _add_phase_b_benchmark(self):
@@ -455,13 +716,42 @@ class FedCastWorkflow:
 
     # -- Phase C: training ------------------------------------------------
     def _client_specs(self):
-        """LFN dicts for all clients, as consumed by fl_round."""
-        return [
-            {"name": site,
-             "sequences": self.site_files[site]["sequences"].lfn,
-             "manifest": self.site_files[site]["manifest"].lfn}
-            for site in self.sites
-        ]
+        """Client specs for fl_round.
+
+        Emulated mode yields LFNs, which fl_round declares as staged job
+        inputs. Cross-silo mode yields absolute on-worker paths plus the
+        HTCondor requirements expression that pins the client's jobs to
+        the silo holding them, so the shard is read in place and never
+        staged.
+        """
+        specs = []
+        for site in self.sites:
+            if self.silos:
+                paths = self.silo_paths(site)
+                spec = {"name": site,
+                        "sequences": paths["sequences"],
+                        "manifest": paths["manifest"],
+                        "requirements":
+                            self._silo_requirements(site, gpu=True)}
+            else:
+                spec = {"name": site,
+                        "sequences": self.site_files[site]["sequences"].lfn,
+                        "manifest": self.site_files[site]["manifest"].lfn}
+            specs.append(spec)
+        return specs
+
+    def _silo_requirements(self, site, gpu=False):
+        """Silo pin, with the VRAM clause folded in for GPU jobs.
+
+        A job-level requirements profile replaces the transformation-level
+        one, so --min-gpu-memory-mb has to be re-stated here or pinned
+        training would lose its VRAM floor and land on a T4.
+        """
+        expr = self.silos["requirements"][site]
+        if gpu and self.args.min_gpu_memory_mb:
+            expr = (f"({expr}) && (GPUs_GlobalMemoryMb >= "
+                    f"{self.args.min_gpu_memory_mb})")
+        return expr
 
     def _add_centralized_chain(self, method, interval, extra_args=None):
         """Chain of checkpointed centralized training segment jobs.
@@ -638,9 +928,10 @@ class FedCastWorkflow:
             subwf.add_args("--conf", self.subwf_conf,
                            "--output-sites", "local")
             subwf.add_inputs(File(prev_global))
-            for site in self.sites:
-                subwf.add_inputs(self.site_files[site]["sequences"],
-                                 self.site_files[site]["manifest"])
+            if not self.silos:
+                for site in self.sites:
+                    subwf.add_inputs(self.site_files[site]["sequences"],
+                                     self.site_files[site]["manifest"])
             subwf.add_outputs(File(names["global_out"]), stage_out=False,
                               register_replica=False)
             if is_validation:
@@ -656,6 +947,14 @@ class FedCastWorkflow:
                 subwf.add_outputs(File(sub_best_lfn), stage_out=True,
                                   register_replica=False)
             self.wf.add_jobs(subwf)
+            if self.silos and r == 0:
+                # Resident shards are not declared inputs, so the FL chain
+                # would otherwise start before the silos are populated.
+                # Later rounds inherit the edge through the global-model
+                # chain.
+                self.wf.add_dependency(
+                    subwf,
+                    parents=[self.prep_jobs[site] for site in self.sites])
             last_subwf = subwf
             prev_global = names["global_out"]
 
@@ -861,6 +1160,7 @@ Examples:
   %(prog)s --test                          # pilot: 2 sites, 1 month, tiny budget
   %(prog)s --start-month 2021-01 --months 48
   %(prog)s --start-month 2021-01 --months 48 --experiments e1 e21 e22
+  %(prog)s --start-month 2021-01 --months 48 --silos silos.yml
 """,
     )
 
@@ -946,6 +1246,19 @@ Examples:
     parser.add_argument("--max-concurrent-jobs", type=int, default=20,
                         help="DAGMan job throttle (default: 20)")
 
+    # --- Cross-silo placement ---
+    parser.add_argument("--silos", metavar="YAML", type=str, default=None,
+                        help="Cross-silo placement map (see "
+                             "silos.example.yml): pin each client's data "
+                             "and training jobs to the worker holding its "
+                             "shard, so federated training and validation "
+                             "never move it (they return weights plus small "
+                             "per-client counts and losses). The centralized "
+                             "baseline and evaluation still need shards "
+                             "pooled, so each is copied out once by a "
+                             "silo_export job. Default: emulated placement, "
+                             "as in the paper.")
+
     # --- Pilot mode ---
     parser.add_argument("--test", action="store_true",
                         help="Pilot mode: 2 sites, 1 month, 2 rounds, "
@@ -996,10 +1309,15 @@ Examples:
     logger.info(f"Training budget: {args.rounds} rounds/epochs in segments "
                 f"of {args.segment_size}")
     logger.info(f"Execution site: {args.execution_site_name}")
+    if args.silos:
+        logger.info(f"Placement: CROSS-SILO ({args.silos})")
+    else:
+        logger.info("Placement: emulated (shards staged to any worker)")
     logger.info("=" * 70)
 
     try:
         workflow = FedCastWorkflow(args)
+        workflow.log_placement()
         workflow.create_pegasus_properties()
         if not args.skip_sites_catalog:
             workflow.create_sites_catalog(
@@ -1014,6 +1332,10 @@ Examples:
         logger.info(f"\nWorkflow written to {args.output}")
         logger.info(f"Submit: pegasus-plan --submit "
                     f"-s {args.execution_site_name} -o local {args.output}")
+    except ValueError as e:
+        # Silo-map problems are user configuration, not bugs.
+        logger.error(str(e))
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Failed to generate workflow: {e}")
         import traceback
