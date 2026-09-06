@@ -87,7 +87,14 @@ def condor_status(args):
 def check_silos(silos, sites):
     """Report which machines each silo pins to.
 
-    Returns (unresolved sites, matched machine names).
+    Counted by machine name, not by ad: condor_status returns one ad per
+    slot, and a single worker's slots can advertise different TotalGpus
+    (a partitionable slot and the dynamic slots carved from it, or an ad
+    where the attribute is undefined). Counting distinct (Machine, GPUs)
+    pairs would call one worker several machines and reject a perfectly
+    good map.
+
+    Returns (unresolved sites, ambiguous sites, matched machine names).
     """
     missing, ambiguous = [], []
     matched = set()
@@ -95,19 +102,30 @@ def check_silos(silos, sites):
         expr = silos["requirements"][site]
         rows = condor_status(["-constraint", expr,
                               "-af", "Machine", "TotalGpus"])
-        hosts = sorted({(r[0], r[1] if len(r) > 1 else "?") for r in rows})
-        if len(hosts) > 1:
-            print(f"  {site:5s} -> {len(hosts)} MACHINES: " + ", ".join(
-                f"{m} (GPUs={g})" for m, g in hosts))
+
+        machines = {}
+        for row in rows:
+            gpus = row[1] if len(row) > 1 else "?"
+            machines.setdefault(row[0], set()).add(gpus)
+
+        def describe(machine):
+            seen = sorted(v for v in machines[machine]
+                          if v not in ("?", "", "undefined"))
+            return f"{machine} (GPUs={','.join(seen) if seen else '?'})"
+
+        if len(machines) > 1:
+            print(f"  {site:5s} -> {len(machines)} MACHINES: " + ", ".join(
+                describe(m) for m in sorted(machines)))
             ambiguous.append(site)
-            matched.update(m for m, _ in hosts)
-        elif hosts:
-            print(f"  {site:5s} -> " + ", ".join(
-                f"{m} (GPUs={g})" for m, g in hosts))
-            matched.update(m for m, _ in hosts)
+        elif machines:
+            machine = next(iter(machines))
+            slots = len(rows)
+            suffix = f", {slots} slot ads" if slots > 1 else ""
+            print(f"  {site:5s} -> {describe(machine)}{suffix}")
         else:
             print(f"  {site:5s} -> NO MATCH   [{expr}]")
             missing.append(site)
+        matched.update(machines)
     return missing, ambiguous, matched
 
 
