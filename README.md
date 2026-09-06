@@ -174,6 +174,14 @@ payload:
 tools/check_export_docs.py
 ```
 
+And after touching either validation path, run the equivalence test. It calls
+both wrappers with real arguments against a shard on disk, with a stub
+generator, and checks the per-client losses recombine to the central one:
+
+```sh
+tools/test_validation_equivalence.py
+```
+
 As for the shard: the centralized baseline and MCT evaluation need all
 seven in one place, and a run always builds them, so **every silo run
 copies each shard out exactly once**. What silo mode buys is that the copy

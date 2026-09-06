@@ -395,6 +395,15 @@ def generator_val_batch_losses(model, datasets, val_seed):
     """
     import torch
 
+    if isinstance(datasets, dict):
+        # A single load_client_data() result rather than a list of them.
+        # Iterating it would walk the key strings and fail obscurely deep
+        # in the loop, so say what is wrong here instead.
+        raise TypeError(
+            "generator_val_batch_losses expects a list of client datasets; "
+            "got one dataset dict. Wrap it: [data]."
+        )
+
     model.eval()
     device = next(model.parameters()).device
     losses = []

@@ -117,6 +117,8 @@ fedcast-workflow/
 │   └── validate_report.py     # tiered reproduction gates (§5)
 ├── tools/                     # submit-host helpers, not workflow jobs
 │   ├── check_export_docs.py   # fails if a silo job exports an undocumented field
+│   ├── test_validation_equivalence.py  # runs both validation wrappers, checks
+│   │                          # they agree (stub model, CPU, seconds)
 │   ├── silo_check.py          # cross-silo preflight (placement + durability)
 │   ├── silo_worker_setup.sh   # worker prep, only for non-default silo maps
 │   └── timing_extrapolate.py  # project full-study wall-clock from a run dir
@@ -422,6 +424,10 @@ framing.
       reconstructs exactly the central mean, so constraint 9's checkpoint rule
       is unchanged and the modes are comparable. Centralized training
       (`train_dgmr`) uses the same seeding.
+      `tools/test_validation_equivalence.py` exercises both paths **through the
+      wrappers**, with a stub generator, and asserts they agree — testing
+      `generator_val_batch_losses` directly is not enough, since it passes a
+      correctly shaped argument that the wrapper did not.
     - A silo must resolve to exactly one worker — the shard is written to one
       machine and never replicated — which `tools/silo_check.py` enforces
       (`--allow-multi-worker-silo` for a hand-replicated directory).

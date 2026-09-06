@@ -81,7 +81,8 @@ def main():
             model = model.cuda()
         # Per-(client, batch) seeding, matching fl_validate, so this
         # client's numbers are the ones the central path would compute.
-        losses = fc.generator_val_batch_losses(model, data, args.seed)
+        losses = fc.generator_val_batch_losses(model, [data],
+                                               args.seed)
     else:
         logger.warning("%s: no validation sequences in interval",
                        client["name"])
