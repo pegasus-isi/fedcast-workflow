@@ -221,6 +221,7 @@ def generate_round_workflow(
                     "--client",
                     f"{csite}:{client['sequences']}:{client['manifest']}",
                     "--round", str(round_num),
+                    "--seed", str(seed),
                     *interval_args,
                     *pilot_args,
                     "--global-model", global_out,

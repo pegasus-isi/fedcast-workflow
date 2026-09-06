@@ -5,9 +5,14 @@
 Checks, which otherwise surface hours later as an idle job or a container
 that will not start:
 
-1. Every silo resolves. For each client, runs the exact HTCondor
-   requirements expression workflow_generator.py will attach to that
-   client's jobs and lists the machines it matches.
+1. Every silo resolves to exactly one machine. For each client, runs the
+   exact HTCondor requirements expression workflow_generator.py will
+   attach to that client's jobs and lists the machines it matches. More
+   than one is a misconfiguration, not a bonus: the shard is written by
+   one preprocess job to one machine and is never replicated, so a
+   training job that later matches a different machine finds no shard.
+   Pass --allow-multi-worker-silo if you replicate the shard directory
+   yourself.
 
 2. Every worker can satisfy the bind — only when the map needs one. A
    home-relative shard directory is inside Apptainer's default mounts, so
@@ -84,21 +89,26 @@ def check_silos(silos, sites):
 
     Returns (unresolved sites, matched machine names).
     """
-    missing = []
+    missing, ambiguous = [], []
     matched = set()
     for site in sites:
         expr = silos["requirements"][site]
         rows = condor_status(["-constraint", expr,
                               "-af", "Machine", "TotalGpus"])
         hosts = sorted({(r[0], r[1] if len(r) > 1 else "?") for r in rows})
-        if hosts:
+        if len(hosts) > 1:
+            print(f"  {site:5s} -> {len(hosts)} MACHINES: " + ", ".join(
+                f"{m} (GPUs={g})" for m, g in hosts))
+            ambiguous.append(site)
+            matched.update(m for m, _ in hosts)
+        elif hosts:
             print(f"  {site:5s} -> " + ", ".join(
                 f"{m} (GPUs={g})" for m, g in hosts))
             matched.update(m for m, _ in hosts)
         else:
             print(f"  {site:5s} -> NO MATCH   [{expr}]")
             missing.append(site)
-    return missing, matched
+    return missing, ambiguous, matched
 
 
 def check_bind_dir(expected):
@@ -181,6 +191,11 @@ def main():
     parser.add_argument("--sites", nargs="+", default=list(SITES.keys()),
                         choices=list(SITES.keys()),
                         help="clients to check (default: all 7)")
+    parser.add_argument("--allow-multi-worker-silo", action="store_true",
+                        help="accept a silo that matches several machines. "
+                             "Only correct if you replicate the shard "
+                             "directory across them yourself — nothing in "
+                             "the workflow does.")
     parser.add_argument("--allow-unverified", action="store_true",
                         help="exit 0 instead of 3 when a worker's config "
                              "cannot be read, for pools that refuse remote "
@@ -205,7 +220,11 @@ def main():
     print()
 
     print("client placement:")
-    unresolved, matched = check_silos(silos, args.sites)
+    unresolved, ambiguous, matched = check_silos(silos, args.sites)
+    if ambiguous and args.allow_multi_worker_silo:
+        print(f"  ({len(ambiguous)} multi-machine silo(s) accepted via "
+              f"--allow-multi-worker-silo)")
+        ambiguous = []
 
     print("\nshard durability on the matched workers:")
     durability, unverified = check_durability(silos, matched)
@@ -217,12 +236,20 @@ def main():
         if not bad:
             print(f"  none — all {total} machine(s) advertise it")
 
-    if unresolved or bad or durability:
+    if unresolved or ambiguous or bad or durability:
         print()
         if unresolved:
             print(f"{len(unresolved)} silo(s) match no worker: "
                   f"{' '.join(unresolved)}. Run tools/silo_worker_setup.sh "
                   f"on the intended worker(s), or fix {args.silos}.",
+                  file=sys.stderr)
+        if ambiguous:
+            print(f"{len(ambiguous)} silo(s) match more than one machine: "
+                  f"{' '.join(ambiguous)}. The shard is written to one "
+                  f"machine and never replicated, so a later job matching "
+                  f"another would find nothing. Narrow the map (pin by "
+                  f"machine name), or pass --allow-multi-worker-silo if you "
+                  f"replicate the shard directory yourself.",
                   file=sys.stderr)
         if bad:
             print(f"{len(bad)} worker(s) cannot satisfy the bind. Run "

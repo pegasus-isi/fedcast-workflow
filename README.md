@@ -101,7 +101,7 @@ is a data holder and **the federated arm never moves its shard**:
 | Shard location | submit-host staging | resident on the silo worker |
 | Client job placement | any matching slot | pinned to its silo |
 | Shard staged per FL round | yes, per client | never |
-| Validation | server reads every client's split | each client scores at its silo, returns batch-loss sums |
+| Validation | server reads every client's split | each client scores at its silo, returns batch-loss sums and counts |
 | Leaves the silo, federated arm | shards + weights | model weights plus small per-client metadata (below) |
 | Leaves the silo, pooled arms | n/a (already central) | the whole shard, once, via `silo_export` |
 
@@ -181,10 +181,15 @@ is one visible, pinned job per client instead of a shard transfer per
 client per round — 7 copies rather than 7 x rounds — and that the
 federated arm's number is zero.
 
-Both modes select the checkpoint from the same number: the per-client
-metrics carry batch-loss sums and batch counts, and `fl_validate`
-recombines them into exactly the mean batch loss the central path
-computes.
+Both modes select the checkpoint from the same number, and that is
+arranged rather than assumed. The validation loss averages a 6-sample
+DGMR ensemble, so it depends on the random stream; each batch is therefore
+seeded from the training seed, the client name and the batch index, which
+makes a batch's loss independent of who computes it and in what order. The
+per-client metrics carry batch-loss sums and batch counts, and
+`fl_validate` recombines them into exactly the mean the central path
+computes. Centralized training uses the same seeding, so all three paths
+score a checkpoint identically.
 
 That export is deliberate, not an oversight. Pooling every client's data
 is *what the centralized baseline is*, and it is the thing the paper
@@ -295,10 +300,14 @@ the container's `mounts`.
 
 ### Choosing a pool
 
-A silo may be a single worker, since the preprocess job writes the shard to
-one machine and does not replicate it. Several clients may share a worker,
-which is how seven clients fit a pool with fewer than seven GPU nodes; each
-still reads only its own shard.
+A silo must resolve to exactly one worker. The preprocess job writes the
+shard to one machine and nothing replicates it, so a training job that
+later matched a second machine would find nothing there. `silo_check.py`
+fails on a silo that matches more than one machine and names it; if you
+replicate the shard directory across them yourself, pass
+`--allow-multi-worker-silo`. Several clients may share a worker, which is
+how seven clients fit a pool with fewer than seven GPU nodes; each still
+reads only its own shard.
 
 Pinning trades scheduling freedom for locality, so size the pool by GPU
 slots rather than worker count. Seven clients pinned onto two GPU workers

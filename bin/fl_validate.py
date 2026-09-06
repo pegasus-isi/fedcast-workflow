@@ -104,7 +104,10 @@ def main():
         model.load_state_dict(global_state)
         if torch.cuda.is_available():
             model = model.cuda()
-        val = fc.generator_val_loss(model, data)
+        # Same per-(client, batch) seeding the silo path uses, so the two
+        # modes score a checkpoint identically.
+        val = fc.generator_val_loss(model, data,
+                                    history.get("seed", 42))
     unit = args.round + 1  # 1-indexed round count, mirroring epochs
     history["val_points"].append({"unit": unit, "val_loss": val})
     logger.info("Round %d (unit %d): generator val loss %.6f",

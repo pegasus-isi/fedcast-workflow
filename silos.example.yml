@@ -51,8 +51,11 @@ data_dir: ~/.fedcast/silos
 #
 # Several silos may share one worker — that is how seven clients fit a pool
 # with fewer than seven GPU nodes; each still reads only its own shard.
-# A silo should be a single worker, since the preprocess job writes the
-# shard to one machine and does not replicate it.
+# A silo must resolve to exactly ONE worker: the preprocess job writes the
+# shard to one machine and nothing replicates it, so a training job that
+# matched a second machine would find nothing. tools/silo_check.py fails on
+# a silo matching more than one machine (override with
+# --allow-multi-worker-silo only if you replicate data_dir yourself).
 
 attribute: FEDCAST_SILOS
 

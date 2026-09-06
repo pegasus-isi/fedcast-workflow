@@ -410,10 +410,21 @@ framing.
       needs it for the Eq. 8 quadratic-weighting ablation) and
       `n_val`/`n_batches`/loss sum and mean from validation.
     - Validation is split: each client scores the new global model on its own split
-      at its silo and returns batch-loss sums; `fl_validate --client-metrics`
-      recombines them. `fedcast_common.combine_client_val_metrics` reconstructs
-      exactly the mean batch loss the central path computes, so constraint 9's
-      checkpoint rule is unchanged and the two modes are comparable.
+      at its silo and returns batch-loss sums and counts; `fl_validate
+      --client-metrics` recombines them. Equivalence is arranged, not assumed:
+      the loss averages a 6-sample DGMR ensemble and so depends on the RNG
+      stream, which previously differed between the two paths (the silo
+      validator reset the RNG to 0 while the central one seeded from the run
+      seed and ran one continuous stream, measurably diverging). Each batch is
+      now seeded from (run seed, client name, batch index) in
+      `generator_val_batch_losses`, making a batch's loss independent of who
+      computes it and in what order; `combine_client_val_metrics` then
+      reconstructs exactly the central mean, so constraint 9's checkpoint rule
+      is unchanged and the modes are comparable. Centralized training
+      (`train_dgmr`) uses the same seeding.
+    - A silo must resolve to exactly one worker — the shard is written to one
+      machine and never replicated — which `tools/silo_check.py` enforces
+      (`--allow-multi-worker-silo` for a hand-replicated directory).
     - **The federated arm's zero-egress property does not extend to the run as a
       whole.** The centralized baseline and MCT evaluation need shards pooled —
       that is the thing the paper measures federation against — and every run

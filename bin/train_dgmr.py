@@ -145,7 +145,7 @@ def main():
         fc.fit_one_epoch(model, fc.make_loader(xs, ys), epochs=1)
         history["unit"] = unit
         if unit % args.validate_every == 0 or unit == args.total_units:
-            val = fc.generator_val_loss(model, data)
+            val = fc.generator_val_loss(model, data, args.seed)
             history["val_points"].append({"unit": unit, "val_loss": val})
             logger.info("Epoch %d: generator val loss %.6f", unit, val)
             if history["best_val"] is None or val < history["best_val"]:

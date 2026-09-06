@@ -42,6 +42,9 @@ def main():
     parser.add_argument("--client", required=True,
                         help="SITE:sequences_path:manifest_path")
     parser.add_argument("--round", type=int, required=True)
+    parser.add_argument("--seed", type=int, required=True,
+                        help="Training seed; also seeds validation "
+                             "sampling, identically to the central path")
     parser.add_argument("--interval-months", type=int, required=True)
     parser.add_argument("--archive-start", required=True, help="YYYY-MM")
     parser.add_argument("--archive-months", type=int, required=True)
@@ -72,11 +75,13 @@ def main():
     losses = []
     if n_val:
         global_state = torch.load(args.global_model, map_location="cpu")
-        model = fc.build_model(0)
+        model = fc.build_model(args.seed)
         model.load_state_dict(global_state)
         if torch.cuda.is_available():
             model = model.cuda()
-        losses = fc.generator_val_batch_losses(model, data)
+        # Per-(client, batch) seeding, matching fl_validate, so this
+        # client's numbers are the ones the central path would compute.
+        losses = fc.generator_val_batch_losses(model, data, args.seed)
     else:
         logger.warning("%s: no validation sequences in interval",
                        client["name"])

@@ -362,14 +362,31 @@ def fit_one_epoch(model, loader, epochs=1):
     trainer.fit(model, loader)
 
 
-def generator_val_batch_losses(model, datasets):
+def _val_batch_seed(val_seed, client_name, batch_index):
+    """Deterministic RNG seed for one client's validation batch.
+
+    The loss draws a 6-sample DGMR ensemble, so it depends on the RNG
+    state. Deriving that state from (seed, client, batch) instead of
+    letting a continuous stream run makes the number independent of who
+    computes it and in what order — which is what lets the emulated and
+    cross-silo paths select the same checkpoint. crc32, not hash(), so it
+    is stable across processes.
+    """
+    import zlib
+
+    digest = zlib.crc32(str(client_name).encode("utf-8"))
+    return (int(val_seed) + digest + batch_index * 7919) % (2 ** 31)
+
+
+def generator_val_batch_losses(model, datasets, val_seed):
     """Per-batch grid-cell-regularizer validation losses.
 
-    Shared by the central validator (all clients' datasets at once) and the
-    silo-mode per-client validator (one dataset at the silo), so both paths
-    produce identical numbers: the checkpoint loss is the mean over these
-    batch losses, and a mean of means weighted by batch count reconstructs
-    it exactly.
+    Shared by the central validator (all clients' datasets at once) and
+    the silo-mode per-client validator (one dataset at the silo). Each
+    batch's ensemble is drawn from a seed derived from the client name
+    and the batch index, so both paths produce identical numbers: the
+    checkpoint loss is the mean over these batch losses, and a mean of
+    means weighted by batch count reconstructs it exactly.
 
     TODO: add the discriminator hinge term to fully match the paper's
     Eq. 3; the grid-cell term (lambda=20, intensity-weighted MAE on the
@@ -386,7 +403,10 @@ def generator_val_batch_losses(model, datasets):
             val_x, val_y = d["val"]
             if val_x is None:
                 continue
-            for i in range(0, val_x.shape[0], BATCH_SIZE):
+            for batch_index, i in enumerate(
+                    range(0, val_x.shape[0], BATCH_SIZE)):
+                torch.manual_seed(
+                    _val_batch_seed(val_seed, d["name"], batch_index))
                 x = val_x[i:i + BATCH_SIZE].to(device)
                 y = val_y[i:i + BATCH_SIZE].to(device)
                 preds = torch.stack(
@@ -398,9 +418,9 @@ def generator_val_batch_losses(model, datasets):
     return losses
 
 
-def generator_val_loss(model, datasets):
+def generator_val_loss(model, datasets, val_seed):
     """Grid-cell-regularizer validation loss over all clients' val sets."""
-    losses = generator_val_batch_losses(model, datasets)
+    losses = generator_val_batch_losses(model, datasets, val_seed)
     return float(np.mean(losses)) if losses else float("inf")
 
 
