@@ -424,10 +424,13 @@ framing.
       reconstructs exactly the central mean, so constraint 9's checkpoint rule
       is unchanged and the modes are comparable. Centralized training
       (`train_dgmr`) uses the same seeding.
-      `tools/test_validation_equivalence.py` exercises both paths **through the
-      wrappers**, with a stub generator, and asserts they agree — testing
-      `generator_val_batch_losses` directly is not enough, since it passes a
-      correctly shaped argument that the wrapper did not.
+      `tools/test_validation_equivalence.py` exercises all three wrapper entry
+      points with real argv and a stub generator — `fl_validate_client` per
+      client, then `fl_validate` on both its `--client` and `--client-metrics`
+      branches — and asserts the loss each records in its history file agrees.
+      Testing `generator_val_batch_losses` directly is not enough: it passes a
+      correctly shaped argument the wrapper did not, and the recombination
+      branch is a call site of its own.
     - A silo must resolve to exactly one worker — the shard is written to one
       machine and never replicated — which `tools/silo_check.py` enforces
       (`--allow-multi-worker-silo` for a hand-replicated directory).

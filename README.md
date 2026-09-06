@@ -175,8 +175,10 @@ tools/check_export_docs.py
 ```
 
 And after touching either validation path, run the equivalence test. It calls
-both wrappers with real arguments against a shard on disk, with a stub
-generator, and checks the per-client losses recombine to the central one:
+all three wrapper entry points with real arguments against a shard on disk,
+using a stub generator — the per-client validator, then the central one on
+both its direct and its recombining branch — and checks that the loss each
+records in its history file agrees:
 
 ```sh
 tools/test_validation_equivalence.py

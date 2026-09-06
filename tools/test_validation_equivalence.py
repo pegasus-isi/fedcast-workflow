@@ -6,16 +6,20 @@
 
 Checks two things that have to hold for cross-silo mode to be usable:
 
-1. **The wrappers run.** `fl_validate_client.main()` and the central
-   `fl_validate.main()` are called with real argv against a real shard on
-   disk. A previous bug passed a single dataset dict where a list of them
-   was expected, which crashed for every client that had validation data —
-   and was invisible to tests that called `generator_val_batch_losses`
-   directly with a correctly shaped argument. Testing the helper is not
-   testing the call site.
-2. **The two paths agree.** The per-client losses recombine to exactly the
-   loss the central path computes, which is what lets either mode select
-   the same checkpoint.
+1. **All three wrapper entry points run**, each called with real argv
+   against a real shard on disk: `fl_validate_client.main()` per client,
+   then `fl_validate.main()` twice — once on its `--client` branch, which
+   scores every split centrally, and once on its `--client-metrics`
+   branch, which recombines what the silos returned. A previous bug passed
+   a single dataset dict where a list of them was expected, crashing for
+   every client that had validation data, and was invisible to a test that
+   called `generator_val_batch_losses` directly with a correctly shaped
+   argument. Testing the helper is not testing the call site, and the
+   recombination branch is a call site of its own.
+2. **The two paths agree**, compared where it actually matters: the
+   validation loss each one records in the history file it writes. That
+   is the number the checkpoint rule reads, so agreement there is what
+   lets either mode select the same checkpoint.
 
 DGMR itself is replaced by a stub with the same interface: this is about
 the plumbing and the arithmetic, not the model. Runs on CPU in seconds and
@@ -136,27 +140,77 @@ def main():
                                 f"client that has validation data")
             per_client.append(metrics)
 
-        # ---- path 2: the server scores every client itself ------------
-        t_start = fc.interval_start_epoch(START_MONTH, ARCHIVE_MONTHS,
-                                          INTERVAL)
-        datasets = [
-            fc.load_client_data(
-                fc.parse_client(f"{site}:{seq}:{man}"), t_start)
-            for site, seq, man in clients
-        ]
-        model = fc.build_model(SEED)
-        model.load_state_dict(torch.load(global_model, map_location="cpu"))
-        central = fc.generator_val_loss(model, datasets, SEED)
+        # ---- the central wrapper, both of its branches ---------------
+        import fl_validate
 
-        # ---- they must agree -----------------------------------------
-        if per_client:
-            recombined = fc.combine_client_val_metrics(per_client)
+        history_in = work / "history_in.json"
+        history_in.write_text(json.dumps({
+            "best_val": None, "best_unit": -1, "mode": "federated",
+            "aggregation": "uniform", "seed": SEED,
+            "interval_months": INTERVAL, "val_points": [],
+        }))
+        best_in = work / "best_in.pt"
+        torch.save({"state_dict": StubDGMR().state_dict(), "val": None},
+                   best_in)
+
+        def run_central(tag, extra_args):
+            """Drive fl_validate.main() and return the loss it recorded."""
+            history_out = work / f"history_{tag}.json"
+            argv = [
+                "fl_validate.py",
+                "--round", "4",
+                *interval_args,
+                "--global-model", str(global_model),
+                "--history-in", str(history_in),
+                "--best-in", str(best_in),
+                "--history-out", str(history_out),
+                "--best-out", str(work / f"best_{tag}.pt"),
+                *extra_args,
+            ]
+            saved, sys.argv = sys.argv, argv
+            try:
+                fl_validate.main()
+            except SystemExit as exc:
+                if exc.code not in (None, 0):
+                    failures.append(f"fl_validate({tag}) exited {exc.code}")
+                    return None
+            except Exception as exc:                        # noqa: BLE001
+                failures.append(f"fl_validate({tag}) raised "
+                                f"{type(exc).__name__}: {exc}")
+                return None
+            finally:
+                sys.argv = saved
+
+            if not history_out.exists():
+                failures.append(f"fl_validate({tag}) wrote no history")
+                return None
+            points = json.loads(history_out.read_text())["val_points"]
+            if not points:
+                failures.append(f"fl_validate({tag}) recorded no val point")
+                return None
+            return points[-1]["val_loss"]
+
+        # branch 1: the server reads every client's split itself
+        central = run_central("emulated", [
+            arg for site, seq, man in clients
+            for arg in ("--client", f"{site}:{seq}:{man}")
+        ])
+
+        # branch 2: the server recombines what the silos returned
+        recombined = run_central("silo", [
+            arg for site, _, _ in clients
+            for arg in ("--client-metrics", str(work / f"metrics_{site}.json"))
+        ])
+
+        # ---- they must agree, at the number the checkpoint rule reads --
+        if central is not None and recombined is not None:
             if abs(central - recombined) > 1e-9:
                 failures.append(
-                    f"validation paths disagree: central {central!r} vs "
-                    f"recombined {recombined!r}")
+                    f"validation paths disagree in the history they write: "
+                    f"emulated {central!r} vs cross-silo {recombined!r}")
             else:
-                print(f"  central and recombined agree: {central:.9f}")
+                print(f"  both branches of fl_validate recorded "
+                      f"{central:.9f}")
             batches = sum(m["n_batches"] for m in per_client)
             print(f"  {len(per_client)} clients, {batches} validation "
                   f"batches scored through the wrappers")
