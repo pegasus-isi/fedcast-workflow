@@ -190,8 +190,7 @@ fed_L1_global_r001.pt at site compute
 ```
 
 Plan such a site with `--cleanup leaf`, which the generator adds to the
-`pegasus-plan` command it prints when the catalog says the site stages on
-itself:
+`pegasus-plan` command it prints whenever the site might stage on itself:
 
 ```sh
 pegasus-plan --submit -s compute --cleanup leaf --output-dir output workflow.yml
@@ -210,6 +209,20 @@ scratch behind.
 An HTCondor pool using `condorio` — what `custom_sites.py --style condor
 --full` writes — stages through the submit host, so its staging site is
 `local`, none of this applies, and the planner default is right.
+
+The generator decides in this order, and says which step answered:
+
+1. a `data.configuration` on the compute site, in `sites.yml` or in the
+   catalog it overlays;
+2. otherwise the submission style — `condor`/`condorc` is condorio, and
+   anything glite-shaped stages on itself;
+3. otherwise, if `~/.pegasusrc` names a hosted catalog that has not been
+   downloaded into this directory yet, leaf. This is the first run
+   against a cluster, before any `pegasus-plan` has fetched the catalog:
+   nobody publishes a hosted catalog for a personal condor pool, so the
+   site is a batch site, and leaf is the option that plans either way.
+   Pass `--base-catalog unity.yml` (fetch it with the `curl` above) to
+   settle it from the catalog instead of the assumption.
 
 ## Data placement: emulated vs. cross-silo
 

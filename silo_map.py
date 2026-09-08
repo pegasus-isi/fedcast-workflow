@@ -247,6 +247,27 @@ def site_stages_on_compute(site_name, sites_yml=None, base_catalog=None):
     return None
 
 
+def site_submission_style(site_name, sites_yml=None, base_catalog=None):
+    """The scheduler a site submits to, over an overlay and its base.
+
+    Same resolution order as site_stages_on_compute: the local overlay
+    first, then the catalog it overlays. None when neither states a
+    style, which is the normal first-run case for an overlay whose
+    hosted catalog has not been downloaded yet.
+    """
+    for path in (sites_yml, base_catalog):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            profiles, _ = read_site_entry(path, site_name)
+        except ValueError:
+            continue
+        style = read_site_style(profiles)
+        if style:
+            return style
+    return None
+
+
 def split_nodelist(spec):
     """Split a Slurm node spec on commas outside [] brackets.
 

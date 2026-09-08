@@ -58,7 +58,7 @@ from fl_round import (
 )
 from silo_map import (
     check_silo_tags, hosted_catalog, load_silo_map, silo_tags,
-    site_stages_on_compute,
+    site_stages_on_compute, site_submission_style,
 )
 
 logging.basicConfig(
@@ -1072,7 +1072,7 @@ class FedCastWorkflow:
         self.wf.add_jobs(val_job)
 
 
-def cleanup_strategy(args, base_catalog):
+def cleanup_strategy(args, base_catalog, hosted):
     """Whether pegasus-plan needs --cleanup leaf on this site.
 
     The FL rounds are deferred sub-workflows, so their per-round
@@ -1091,21 +1091,56 @@ def cleanup_strategy(args, base_catalog):
     checkpoints round by round, which is the part that would otherwise
     grow without bound. Under condorio (a plain HTCondor pool) the
     staging site is the submit host and none of this applies.
+
+    Resolution runs from most to least direct, and ends by assuming leaf
+    is needed rather than assuming it is not. A catalog that states a
+    data configuration settles it; failing that a condor-style site is
+    condorio and anything glite-shaped is not; failing that, a hosted
+    catalog is configured but not here yet — the first-run case, where
+    the site is a batch site by construction (nobody publishes a hosted
+    catalog for a personal condor pool) and omitting --cleanup leaf
+    means the plan aborts. Leaf plans on either kind of site, so the
+    unknown case takes the option that cannot fail to plan.
     """
+    site = args.execution_site_name
     stages_on_compute = site_stages_on_compute(
-        args.execution_site_name, args.sites_yml, base_catalog)
+        site, args.sites_yml, base_catalog)
+    style = site_submission_style(site, args.sites_yml, base_catalog)
+
+    if stages_on_compute is not None:
+        why = "its data.configuration says so"
+    elif style in ("condor", "condorc"):
+        stages_on_compute, why = False, (
+            f"site {site!r} submits to a condor pool, which stages "
+            f"through the submit host")
+    elif style:
+        stages_on_compute, why = True, (
+            f"site {site!r} submits through glite, and batch sites stage "
+            f"through their own scratch")
+    elif hosted:
+        stages_on_compute, why = True, (
+            f"the hosted catalog {hosted} is named in ~/.pegasusrc but is "
+            f"not in this directory yet, so its data configuration cannot "
+            f"be read. Hosted catalogs are batch sites; leaf cleanup is "
+            f"assumed because it plans on either kind of site, while "
+            f"omitting it aborts planning on a batch one. Pass "
+            f"--base-catalog {hosted} to decide this from the catalog "
+            f"itself")
+    else:
+        stages_on_compute, why = False, (
+            "no site catalog here states a data configuration or a "
+            "submission style")
+
     if stages_on_compute:
         logger.info(
-            f"Cleanup: --cleanup leaf, because site "
-            f"{args.execution_site_name!r} stages through its own scratch. "
-            f"Per-file cleanup cannot plan the FL sub-workflow checkpoints "
-            f"(see README, \"Cleanup on a batch site\")")
-    elif stages_on_compute is None:
+            f"Cleanup: --cleanup leaf — {why}. Per-file cleanup cannot "
+            f"plan the FL sub-workflow checkpoints (see README, "
+            f"\"Cleanup on a batch site\")")
+    else:
         logger.info(
-            "Cleanup: planner default. No site catalog here names a "
-            "data.configuration; if planning fails with \"Unable to "
-            "determine cleanup url\", add --cleanup leaf")
-    return bool(stages_on_compute)
+            f"Cleanup: planner default — {why}. If planning fails with "
+            f"\"Unable to determine cleanup url\", add --cleanup leaf")
+    return stages_on_compute
 
 
 def check_site_catalog_setup(args, silos):
@@ -1141,7 +1176,7 @@ def check_site_catalog_setup(args, silos):
 
     # Answered before any early return below, because it applies to every
     # run, cross-silo or not.
-    leaf_cleanup = cleanup_strategy(args, hosted_copy)
+    leaf_cleanup = cleanup_strategy(args, hosted_copy, hosted)
 
     if not silos:
         return leaf_cleanup
