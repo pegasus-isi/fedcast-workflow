@@ -1,8 +1,13 @@
 # Fed-Cast workflow — submit-host requirements.
 # Job-side dependencies live in the Apptainer containers (Apptainer/*.def).
 
-# Workflow generation
-pegasus-wms.api
+# Workflow generation. Job tags, hosted site catalogs and *.expr profiles
+# need Pegasus 5.1.3dev / 6.0.0dev; the matching Python package is a wheel
+# at https://download.pegasus.isi.edu/pegasus/6.0.0.dev0/ (not on PyPI):
+#   pip install https://download.pegasus.isi.edu/pegasus/6.0.0.dev0/pegasus_wms-6.0.0.dev0-py3-none-<platform>.whl
+# The pegasus-wms.api pin below is the PyPI fallback for reading the code;
+# it cannot generate this workflow.
+pegasus-wms.api>=5.1.2
 PyYAML
 
 # Local development / running bin/ scripts outside containers

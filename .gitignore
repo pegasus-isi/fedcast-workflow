@@ -31,3 +31,10 @@ _CR_escience_2026.pdf
 fl_rounds/
 fl_subwf.properties
 fl_subwf_rc.yml
+
+# Hosted site catalogs pegasus-plan downloads into the working directory
+access-pegasus*.yml
+nersc-perlmutter.yml
+ospool-ap4*.yml
+unity.yml
+usc-*.yml

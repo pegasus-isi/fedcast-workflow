@@ -15,9 +15,19 @@ Pipeline phases (SPEC.md Sec. 1.1):
   D. Evaluation — MCT-style inference + verification per (method, L), TOPSIS
   E. Ablations  — E2.1 quadratic client weighting, E2.2 SAM centralized
 
+Sites. The workflow does not describe any scheduler. Every transformation
+states only what it needs — cores, memory, GPUs, runtime — and GPU jobs
+carry the Pegasus tag "gpu" (pinned silo jobs carry "silo_<SITE>" or
+"silo_<SITE>_gpu"). Where those jobs run, and what a tag means there
+(partition, account, constraints, --nodelist, ClassAd requirements), comes
+from the site catalog: a hosted one selected in ~/.pegasusrc
+(pegasus.catalog.site.repo.file), optionally overlaid by a local sites.yml
+written by custom_sites.py. Needs Pegasus >= 5.1.3dev / 6.0.0dev for tags.
+
 Usage:
     # Pilot (2 sites, 1 month, tiny training budget):
     ./workflow_generator.py --test
+    pegasus-plan --submit -s compute --output-dir output workflow.yml
 
     # Full E1 reproduction (7 sites, 48 months, 100 rounds/epochs):
     ./workflow_generator.py --start-month 2021-01 --months 48
@@ -25,6 +35,11 @@ Usage:
     # Include ablations:
     ./workflow_generator.py --start-month 2021-01 --months 48 \
         --experiments e1 e21 e22
+
+    # Cross-silo placement (the site catalog defines the silo tags):
+    ./custom_sites.py --style slurm --silos silos.yml
+    ./workflow_generator.py --start-month 2021-01 --months 48 \
+        --silos silos.yml
 """
 
 import argparse
@@ -33,7 +48,6 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
 from Pegasus.api import *
 
 from fl_round import (
@@ -41,6 +55,9 @@ from fl_round import (
     generate_round_workflow,
     init_file_names,
     round_file_names,
+)
+from silo_map import (
+    check_silo_tags, hosted_catalog, load_silo_map, silo_tags,
 )
 
 logging.basicConfig(
@@ -75,29 +92,67 @@ SITES = {
 
 EVENT_SOURCES = ["mpd", "lsr", "storm_events"]
 
-# Per-tool resource configuration.
+# Per-tool resource configuration: the only resource statements the
+# workflow makes. Everything scheduler-specific (queue/partition, account,
+# GPU constraints, node pins) belongs in the site catalog, keyed by tag.
+#
+# runtime is a wall-clock budget in seconds. Batch sites kill a job that
+# exceeds it, so the values are deliberately generous for full-scale inputs
+# and doubled on retry (RUNTIME_EXPR); --runtime-scale multiplies them all.
+# Sizes stay workflow knobs on purpose: transformation-catalog profiles
+# outrank site-catalog ones, so a tag cannot shrink them — what a tag does
+# is say how the request is expressed on the pool (partition, constraint).
 TOOL_CONFIGS = {
-    "fetch_crop_mrms":      {"memory": "4 GB",  "cores": 1, "container": "data"},
-    "preprocess_sequences": {"memory": "16 GB", "cores": 4, "container": "data"},
-    "fetch_events":         {"memory": "2 GB",  "cores": 1, "container": "data"},
-    "build_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data"},
+    "fetch_crop_mrms":      {"memory": "4 GB",  "cores": 1, "container": "data",
+                             "runtime": 6 * 3600},
+    "preprocess_sequences": {"memory": "16 GB", "cores": 4, "container": "data",
+                             "runtime": 4 * 3600},
+    "fetch_events":         {"memory": "2 GB",  "cores": 1, "container": "data",
+                             "runtime": 3600},
+    "build_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data",
+                             "runtime": 1800},
     "train_dgmr":           {"memory": "32 GB", "cores": 8, "container": "train",
-                             "gpus": 1},
-    "fl_init":              {"memory": "8 GB",  "cores": 2, "container": "train"},
+                             "gpus": 1, "runtime": 12 * 3600},
+    "fl_init":              {"memory": "8 GB",  "cores": 2, "container": "train",
+                             "runtime": 1800},
     "fl_train_client":      {"memory": "32 GB", "cores": 8, "container": "train",
-                             "gpus": 1},
-    "fl_aggregate":         {"memory": "16 GB", "cores": 2, "container": "train"},
+                             "gpus": 1, "runtime": 2 * 3600},
+    "fl_aggregate":         {"memory": "16 GB", "cores": 2, "container": "train",
+                             "runtime": 1800},
     "fl_validate":          {"memory": "32 GB", "cores": 8, "container": "train",
-                             "gpus": 1},
+                             "gpus": 1, "runtime": 3600},
     "fl_validate_client":   {"memory": "32 GB", "cores": 8, "container": "train",
-                             "gpus": 1},
+                             "gpus": 1, "runtime": 3600},
     "mct_infer":            {"memory": "16 GB", "cores": 4, "container": "eval",
-                             "gpus": 1},
-    "mct_verify":           {"memory": "8 GB",  "cores": 4, "container": "eval"},
-    "mct_topsis":           {"memory": "2 GB",  "cores": 1, "container": "eval"},
-    "make_figures":         {"memory": "4 GB",  "cores": 1, "container": "eval"},
-    "validate_report":      {"memory": "4 GB",  "cores": 1, "container": "eval"},
+                             "gpus": 1, "runtime": 4 * 3600},
+    "mct_verify":           {"memory": "8 GB",  "cores": 4, "container": "eval",
+                             "runtime": 2 * 3600},
+    "mct_topsis":           {"memory": "2 GB",  "cores": 1, "container": "eval",
+                             "runtime": 900},
+    "make_figures":         {"memory": "4 GB",  "cores": 1, "container": "eval",
+                             "runtime": 900},
+    "validate_report":      {"memory": "4 GB",  "cores": 1, "container": "eval",
+                             "runtime": 900},
 }
+
+# Uncontainerized helpers: the shard copy at a silo, and the two submit-host
+# bridges. Small and quick, but a batch site still needs a runtime for them.
+HELPER_RUNTIME = 1800
+
+# Tag carried by every GPU job. Hosted site catalogs define it (Unity,
+# Perlmutter: GPU partition, gpus, --nv); custom_sites.py adds it for pools
+# that have no hosted catalog.
+GPU_TAG = "gpu"
+
+# Double the wall-clock budget on retry (needs dagman.post.arguments=-U,
+# set in the properties, and the pythonsed package on the submit host).
+RUNTIME_EXPR = ("int(pegasus_job_runtime * 2) if job_retry > 0 "
+                "else pegasus_job_runtime")
+
+
+def gpu_tag_for(tool_name):
+    """The tag a job of this tool carries when not pinned, or None."""
+    return GPU_TAG if TOOL_CONFIGS[tool_name].get("gpus") else None
 
 
 def month_range(start_month, n_months):
@@ -113,168 +168,10 @@ def month_range(start_month, n_months):
     return months
 
 
-DEFAULT_SILO_ATTRIBUTE = "FEDCAST_SILOS"
-DEFAULT_SILO_DATA_DIR = "~/.fedcast/silos"
-
-# Apptainer mounts the job user's home from the host by default, so a
-# shard kept under it needs no --bind and therefore no pre-created
-# directory on the worker: the preprocess job makes its own. Anywhere else
-# the bind is required, and Apptainer refuses to start when its source is
-# missing.
-#
-# /tmp and /var/tmp are deliberately NOT here even though Apptainer mounts
-# them too: HTCondor defaults MOUNT_UNDER_SCRATCH to "/tmp,/var/tmp", which
-# makes both private to each job and deletes them when the job ends. A
-# shard written there would be gone before the next round read it.
-AUTO_MOUNTED_PREFIXES = ("~/",)
-
-# Same reason — warn if someone points data_dir at one of these anyway.
-SCRATCH_MOUNTED_DIRS = ("/tmp", "/var/tmp")
-
-
-def under_scratch_mount(data_dir, roots=SCRATCH_MOUNTED_DIRS):
-    """The scratch-mounted root containing data_dir, or None.
-
-    Matches the directory itself as well as anything under it, so a bare
-    "/tmp" is caught alongside "/tmp/fedcast". Trailing slashes and "." or
-    ".." segments are normalized away first, since a path that only looks
-    different still resolves into the same private per-job mount.
-    """
-    if data_dir.startswith("~"):
-        return None
-    target = os.path.normpath(data_dir)
-    for root in roots:
-        root = os.path.normpath(root)
-        if target == root or target.startswith(root + os.sep):
-            return root
-    return None
-
-
-def needs_container_bind(data_dir):
-    """True if data_dir must be bind-mounted into the containers."""
-    return not data_dir.startswith(AUTO_MOUNTED_PREFIXES)
-
-
-def load_silo_map(path, sites):
-    """Parse a silo map (see silos.example.yml) into placement rules.
-
-    Returns a dict with ``data_dir`` (the on-worker root holding resident
-    shards) and ``requirements`` mapping each requested site to the
-    HTCondor requirements expression that pins its jobs to the worker
-    holding its data.
-
-    Every way the file can be wrong — unreadable, unparseable, or the
-    right YAML but the wrong shape — is raised as ValueError with a
-    message naming the file, so callers report configuration mistakes
-    rather than tracebacks.
-    """
-    try:
-        with open(path) as f:
-            doc = yaml.safe_load(f)
-    except OSError as exc:
-        # Missing, unreadable, or a directory. Raised as ValueError like
-        # every other failure here so both entry points report it the
-        # same way; see this function's contract above.
-        raise ValueError(
-            f"{path}: cannot read the silo map: {exc.strerror or exc} "
-            f"(start from silos.example.yml)"
-        ) from exc
-    except UnicodeDecodeError as exc:
-        # A ValueError already, so it would surface without a file name.
-        raise ValueError(
-            f"{path}: not a text file ({exc.reason}) — expected YAML"
-        ) from exc
-    except yaml.YAMLError as exc:
-        raise ValueError(f"{path}: not valid YAML: {exc}") from exc
-
-    if doc is None:
-        doc = {}
-    if not isinstance(doc, dict):
-        raise ValueError(
-            f"{path}: expected a mapping at the top level, found "
-            f"{type(doc).__name__} — see silos.example.yml"
-        )
-
-    data_dir = doc.get("data_dir", DEFAULT_SILO_DATA_DIR)
-    attribute = doc.get("attribute", DEFAULT_SILO_ATTRIBUTE)
-    for key, value in (("data_dir", data_dir), ("attribute", attribute)):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"{path}: '{key}' must be a non-empty string, found "
-                f"{value!r}"
-            )
-
-    silos = doc.get("silos")
-    if silos is None:
-        silos = {}
-    if not isinstance(silos, dict):
-        raise ValueError(
-            f"{path}: 'silos' must be a mapping of site name to placement, "
-            f"found {type(silos).__name__} — see silos.example.yml"
-        )
-
-    missing = [s for s in sites if s not in silos]
-    if missing:
-        raise ValueError(
-            f"{path}: no silo defined for {', '.join(missing)} — every "
-            f"client in --sites needs an entry under 'silos:'"
-        )
-
-    requirements = {}
-    for site in sites:
-        entry = silos[site]
-        if entry is None:
-            entry = {}
-        if not isinstance(entry, dict):
-            raise ValueError(
-                f"{path}: silo '{site}' must be a mapping such as "
-                f"{{machine: \"host\"}} or {{}}, found "
-                f"{type(entry).__name__}"
-            )
-        for key in ("machine", "requirements"):
-            if key in entry and not isinstance(entry[key], str):
-                raise ValueError(
-                    f"{path}: silo '{site}' has a non-string '{key}': "
-                    f"{entry[key]!r}"
-                )
-        if entry.get("requirements"):
-            expr = entry["requirements"]
-        elif entry.get("machine"):
-            expr = f'(Machine == "{entry["machine"]}")'
-        else:
-            # Worker advertises its hosted silos as a comma-separated
-            # string in `attribute` (tools/silo_worker_setup.sh).
-            # stringListMember matches whole entries, so silo "KTLX"
-            # never matches a worker hosting only "KTLXX", and the
-            # =?= keeps the expression False (not undefined) on workers
-            # that do not advertise the attribute at all.
-            expr = (f'(stringListMember("{site}", '
-                    f'{attribute}) =?= True)')
-        requirements[site] = expr
-
-    scratch_root = under_scratch_mount(data_dir)
-    if scratch_root:
-        logger.warning(
-            "%s: data_dir %s is %s, which HTCondor makes private per job by "
-            "default (MOUNT_UNDER_SCRATCH=/tmp,/var/tmp). Each job would "
-            "get its own empty copy and the shard would be deleted when "
-            "the preprocess job ends. Use a home-relative path, or an "
-            "absolute path outside /tmp and /var/tmp with "
-            "tools/silo_worker_setup.sh.", path, data_dir,
-            "in " + scratch_root if os.path.normpath(data_dir) != scratch_root
-            else scratch_root + " itself")
-
-    return {"data_dir": data_dir, "attribute": attribute,
-            "requirements": requirements, "path": os.path.abspath(path),
-            "needs_bind": needs_container_bind(data_dir),
-            "home_relative": data_dir.startswith("~")}
-
-
 class FedCastWorkflow:
     """Fed-Cast reproduction workflow (see SPEC.md)."""
 
     wf = None
-    sc = None
     tc = None
     rc = None
     props = None
@@ -285,8 +182,12 @@ class FedCastWorkflow:
         self.args = args
         self.dagfile = args.output
         self.wf_dir = str(Path(__file__).parent.resolve())
-        self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
-        self.local_storage_dir = os.path.join(self.wf_dir, "output")
+        # Where staged-out files land on the submit host. Both the parent
+        # (pegasus-plan --output-dir) and every FL-round sub-workflow use
+        # it, so the collect_file/cleanup_file bridges below can address
+        # sub-workflow outputs by path without knowing the site catalog's
+        # local-site layout.
+        self.local_storage_dir = os.path.abspath(args.output_dir)
 
         self.sites = args.sites
         # Cross-silo placement map (None = emulated placement, the paper's
@@ -315,12 +216,27 @@ class FedCastWorkflow:
         # Path to the sub-workflow planning properties (set by
         # write_subworkflow_conf()).
         self.subwf_conf = None
+        # A site-catalog overlay in the working directory (custom_sites.py
+        # writes one). Pegasus merges it over the hosted catalog for the
+        # parent automatically; sub-workflows are told about it explicitly.
+        self.local_sites_yml = (os.path.abspath(args.sites_yml)
+                                if os.path.isfile(args.sites_yml) else None)
 
     def log_placement(self):
         """Say how client data will be placed, and what that assumes."""
         if not self.silos:
             return
         logger.info(f"Shard directory: {self.silos['data_dir']}")
+        if self.silos["scratch_root"]:
+            logger.warning(
+                "%s: data_dir %s is under %s, which HTCondor "
+                "(MOUNT_UNDER_SCRATCH) and Slurm (job_container/tmpfs) "
+                "commonly make private per job and delete when the job "
+                "ends. Each job would get its own empty copy and the shard "
+                "would be gone before the next round. Use a home-relative "
+                "path, or an absolute path outside %s.",
+                self.silos["path"], self.silos["data_dir"],
+                self.silos["scratch_root"], self.silos["scratch_root"])
         if self.silos["needs_bind"]:
             logger.info(
                 "  bind-mounted pool-wide — every worker needs this "
@@ -334,8 +250,6 @@ class FedCastWorkflow:
                 "tools/silo_check.py flags pools where it does not")
 
     def write(self):
-        if self.sc is not None:
-            self.sc.write()
         self.props.write()
         self.rc.write()
         self.tc.write()
@@ -344,52 +258,71 @@ class FedCastWorkflow:
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
-    def create_pegasus_properties(self):
-        self.props = Properties()
-        self.props["pegasus.transfer.threads"] = "16"
+    def base_properties(self):
+        """Properties shared by the parent and the FL-round sub-workflows.
+
+        Starts from ~/.pegasusrc so the hosted-site-catalog selection
+        (pegasus.catalog.site.repo.file) and any site credentials the user
+        keeps there also reach the sub-workflow planner, which is invoked
+        with its own --conf and would otherwise not see them.
+        """
+        rc = Path.home() / ".pegasusrc"
+        props = Properties.load(rc) if rc.is_file() else Properties()
+        props["pegasus.transfer.threads"] = "16"
         # Jobs run inside containers whose OS differs from the submit
         # host (Debian 13 / Ubuntu 22 vs Ubuntu 24). Use the staged
         # worker package regardless of platform mismatch instead of
         # attempting a download the containers can't perform.
-        self.props["pegasus.transfer.worker.package"] = "true"
-        self.props["pegasus.transfer.worker.package.strict"] = "false"
-        self.props["pegasus.transfer.worker.package.autodownload"] = \
-            "false"
+        props["pegasus.transfer.worker.package"] = "true"
+        props["pegasus.transfer.worker.package.strict"] = "false"
+        props["pegasus.transfer.worker.package.autodownload"] = "false"
+        # Symlink an input instead of copying it when the replica
+        # catalog says it already sits on the execution site. A no-op
+        # when they differ, so it is always on.
+        props["pegasus.transfer.links"] = "true"
+        if self.args.shared_filesystem:
+            # Let PegasusLite pull inputs straight from the input site
+            # rather than through the staging server. This assumes the
+            # worker nodes can read that site — true on a cluster with a
+            # shared filesystem, false on a condor pool staging over
+            # HTCondor file transfer, where it would make jobs chase
+            # file:// paths that do not exist on the worker. Worth having
+            # where it applies: the three container images are several GB
+            # each.
+            props["pegasus.transfer.bypass.input.staging"] = "true"
+        if self.local_sites_yml:
+            # Pegasus merges a local sites.yml over the hosted catalog when
+            # it is in the planner's working directory. Naming it here means
+            # the overlay — which is where the silo pins live — is found no
+            # matter where pegasus-plan is run from, and reaches the
+            # sub-workflow planner, which runs elsewhere.
+            props["pegasus.catalog.site"] = "YAML"
+            props["pegasus.catalog.site.file"] = self.local_sites_yml
+        # Retry transients (node failures, preemption, walltime on the
+        # first attempt) and let the *.expr profiles rewrite resource
+        # requests on retry — RUNTIME_EXPR doubles the wall-clock budget.
+        props["dagman.retry"] = str(self.args.retries)
+        props["dagman.post.arguments"] = "-U"
         # Throttle the (site x month) fetch fan-out so we do not hammer the
         # MRMS S3 bucket or the submit host's disk with 336 parallel pulls.
-        self.props["dagman.maxjobs"] = str(self.args.max_concurrent_jobs)
+        props["dagman.maxjobs"] = str(self.args.max_concurrent_jobs)
+        return props
 
-    # ------------------------------------------------------------------
-    # Site Catalog
-    # ------------------------------------------------------------------
-    def create_sites_catalog(self, exec_site_name="condorpool"):
-        self.sc = SiteCatalog()
-
-        local = Site("local").add_directories(
-            Directory(
-                Directory.SHARED_SCRATCH, self.shared_scratch_dir
-            ).add_file_servers(
-                FileServer("file://" + self.shared_scratch_dir, Operation.ALL)
-            ),
-            Directory(
-                Directory.LOCAL_STORAGE, self.local_storage_dir
-            ).add_file_servers(
-                FileServer("file://" + self.local_storage_dir, Operation.ALL)
-            ),
-        )
-
-        exec_site = (
-            Site(exec_site_name)
-            .add_condor_profile(universe="vanilla")
-            .add_pegasus_profile(style="condor")
-        )
-
-        self.sc.add_sites(local, exec_site)
+    def create_pegasus_properties(self):
+        self.props = self.base_properties()
 
     # ------------------------------------------------------------------
     # Transformation Catalog
     # ------------------------------------------------------------------
-    def create_transformation_catalog(self, exec_site_name="condorpool"):
+    def create_transformation_catalog(self):
+        """Executables, containers and per-tool resource needs.
+
+        Every stageable transformation lives on the local site and is
+        shipped to wherever the job runs, so nothing here names an
+        execution site. Resource needs are the portable four — cores,
+        memory, gpus, runtime — and nothing else: no ClassAds, no
+        partitions. Those come from the site catalog by tag.
+        """
         self.tc = TransformationCatalog()
 
         containers = {}
@@ -426,7 +359,6 @@ class FedCastWorkflow:
         for tool_name, cfg in TOOL_CONFIGS.items():
             memory_gb = int(cfg["memory"].split()[0])
             cores = cfg.get("cores", 1)
-            gpus = cfg.get("gpus")
             if cap_gb:
                 # Cap requests so jobs match small-RAM pools (the FABRIC
                 # slice advertises ~14 GB usable per slot).
@@ -434,21 +366,21 @@ class FedCastWorkflow:
                 cores = min(cores, self.args.max_job_cores)
             tx = Transformation(
                 tool_name,
-                site=exec_site_name,
+                site="local",
                 pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
                 is_stageable=True,
                 container=containers[cfg["container"]],
-            ).add_pegasus_profile(memory=f"{memory_gb} GB", cores=cores)
-            if gpus:
-                tx.add_condor_profile(request_gpus=str(gpus))
-                if self.args.min_gpu_memory_mb:
-                    # Pin GPU work to cards with enough VRAM for the
-                    # configured model size (RTX 6000 22.5 GB vs T4 15 GB).
-                    tx.add_profiles(
-                        Namespace.CONDOR, "requirements",
-                        f"(GPUs_GlobalMemoryMb >= "
-                        f"{self.args.min_gpu_memory_mb})",
-                    )
+            ).add_pegasus_profile(
+                memory=f"{memory_gb} GB",
+                cores=cores,
+                runtime=self.runtime(cfg["runtime"]),
+                runtime_expr=RUNTIME_EXPR,
+            )
+            if cfg.get("gpus"):
+                # How a GPU is requested (request_gpus, --gpus, a gres
+                # string) and which cards qualify are the site's business:
+                # the job's "gpu" tag selects that from the site catalog.
+                tx.add_pegasus_profile(gpus=cfg["gpus"])
             if cfg["container"] in ("train", "eval"):
                 # Model geometry travels as env so it also reaches
                 # FL-round SubWorkflow jobs via the shared catalog.
@@ -463,6 +395,7 @@ class FedCastWorkflow:
         self.tc.add_transformations(
             Transformation("collect_file", site="local", pfn="/bin/cp",
                            is_stageable=False)
+            .add_pegasus_profile(runtime=HELPER_RUNTIME)
         )
         if self.silos:
             # Explicit egress boundary: copies a resident shard out of its
@@ -474,10 +407,12 @@ class FedCastWorkflow:
             # home-relative shard path, which Pegasus does not do for
             # job arguments, and reports a missing shard clearly.
             self.tc.add_transformations(
-                Transformation("silo_export", site=exec_site_name,
+                Transformation("silo_export", site="local",
                                pfn=os.path.join(self.wf_dir,
                                                 "bin/silo_export.sh"),
                                is_stageable=True)
+                .add_pegasus_profile(cores=1, memory="1 GB",
+                                     runtime=HELPER_RUNTIME)
             )
         # Incremental deletion of superseded FL-chain artifacts on the
         # output site (each round's 582 MB global model would otherwise
@@ -485,7 +420,12 @@ class FedCastWorkflow:
         self.tc.add_transformations(
             Transformation("cleanup_file", site="local", pfn="/bin/rm",
                            is_stageable=False)
+            .add_pegasus_profile(runtime=HELPER_RUNTIME)
         )
+
+    def runtime(self, seconds):
+        """A tool's wall-clock budget after --runtime-scale."""
+        return max(60, int(round(seconds * self.args.runtime_scale)))
 
     # ------------------------------------------------------------------
     # Replica Catalog — no pre-staged data inputs (everything is fetched
@@ -514,25 +454,18 @@ class FedCastWorkflow:
         sub_rc_path = os.path.abspath("fl_subwf_rc.yml")
         sub_rc.write(sub_rc_path)
 
+        # Sub-workflows are planned with THIS conf, not the parent's
+        # pegasus.properties, so everything in base_properties() — the
+        # hosted site catalog selection, worker-package and transfer
+        # settings — is repeated here, plus the catalog locations.
+        props = self.base_properties()
+        props["pegasus.catalog.transformation"] = "YAML"
+        props["pegasus.catalog.transformation.file"] = \
+            os.path.abspath("transformations.yml")
+        props["pegasus.catalog.replica"] = "YAML"
+        props["pegasus.catalog.replica.file"] = sub_rc_path
         self.subwf_conf = os.path.abspath("fl_subwf.properties")
-        with open(self.subwf_conf, "w") as f:
-            f.write("pegasus.catalog.transformation=YAML\n")
-            f.write("pegasus.catalog.transformation.file="
-                    f"{os.path.abspath('transformations.yml')}\n")
-            if not self.args.skip_sites_catalog:
-                f.write("pegasus.catalog.site=YAML\n")
-                f.write("pegasus.catalog.site.file="
-                        f"{os.path.abspath('sites.yml')}\n")
-            f.write("pegasus.catalog.replica=YAML\n")
-            f.write(f"pegasus.catalog.replica.file={sub_rc_path}\n")
-            # Sub-workflows are planned with THIS conf, not the parent's
-            # pegasus.properties — the worker-package settings must be
-            # repeated here or sub-DAG jobs fail inside containers
-            # (PegasusLite platform mismatch, no curl in image).
-            f.write("pegasus.transfer.threads=16\n")
-            f.write("pegasus.transfer.worker.package=true\n")
-            f.write("pegasus.transfer.worker.package.strict=false\n")
-            f.write("pegasus.transfer.worker.package.autodownload=false\n")
+        props.write(self.subwf_conf)
 
     # ------------------------------------------------------------------
     # Workflow DAG
@@ -621,9 +554,7 @@ class FedCastWorkflow:
                 # so no federated job ever stages it off the worker.
                 silo_dir = self.silo_paths(site)["dir"]
                 prep_job.add_args("--silo-dir", silo_dir)
-                prep_job.add_profiles(
-                    Namespace.CONDOR, "requirements",
-                    self._silo_requirements(site))
+                prep_job.add_pegasus_profile(tag=silo_tags(site)["cpu"])
                 self.wf.add_jobs(prep_job)
                 self._add_silo_export(site, sequences, prep_job)
             else:
@@ -659,8 +590,7 @@ class FedCastWorkflow:
                 _id=f"export_{site}", node_label=f"export_{site}")
             .add_args(self.silo_paths(site)["sequences"], sequences)
             .add_outputs(sequences, stage_out=False, register_replica=False)
-            .add_profiles(Namespace.CONDOR, "requirements",
-                          self._silo_requirements(site))
+            .add_pegasus_profile(tag=silo_tags(site)["cpu"])
             .add_pegasus_profiles(label=site)
         )
         self.wf.add_jobs(job)
@@ -719,10 +649,10 @@ class FedCastWorkflow:
         """Client specs for fl_round.
 
         Emulated mode yields LFNs, which fl_round declares as staged job
-        inputs. Cross-silo mode yields absolute on-worker paths plus the
-        HTCondor requirements expression that pins the client's jobs to
-        the silo holding them, so the shard is read in place and never
-        staged.
+        inputs, and the plain GPU tag. Cross-silo mode yields absolute
+        on-worker paths plus the silo's GPU tag, which the site catalog
+        turns into a pin to the worker holding the shard (and that site's
+        GPU settings), so the shard is read in place and never staged.
         """
         specs = []
         for site in self.sites:
@@ -731,27 +661,16 @@ class FedCastWorkflow:
                 spec = {"name": site,
                         "sequences": paths["sequences"],
                         "manifest": paths["manifest"],
-                        "requirements":
-                            self._silo_requirements(site, gpu=True)}
+                        "resident": True,
+                        "tag": silo_tags(site)["gpu"]}
             else:
                 spec = {"name": site,
                         "sequences": self.site_files[site]["sequences"].lfn,
-                        "manifest": self.site_files[site]["manifest"].lfn}
+                        "manifest": self.site_files[site]["manifest"].lfn,
+                        "resident": False,
+                        "tag": GPU_TAG}
             specs.append(spec)
         return specs
-
-    def _silo_requirements(self, site, gpu=False):
-        """Silo pin, with the VRAM clause folded in for GPU jobs.
-
-        A job-level requirements profile replaces the transformation-level
-        one, so --min-gpu-memory-mb has to be re-stated here or pinned
-        training would lose its VRAM floor and land on a T4.
-        """
-        expr = self.silos["requirements"][site]
-        if gpu and self.args.min_gpu_memory_mb:
-            expr = (f"({expr}) && (GPUs_GlobalMemoryMb >= "
-                    f"{self.args.min_gpu_memory_mb})")
-        return expr
 
     def _add_centralized_chain(self, method, interval, extra_args=None):
         """Chain of checkpointed centralized training segment jobs.
@@ -794,7 +713,8 @@ class FedCastWorkflow:
                 .add_inputs(*seq_inputs)
                 .add_outputs(state_out, stage_out=False,
                              register_replica=False)
-                .add_pegasus_profiles(label=f"{method}_L{interval}")
+                .add_pegasus_profiles(label=f"{method}_L{interval}",
+                                      tag=gpu_tag_for("train_dgmr"))
             )
             for site in self.sites:
                 job.add_args(
@@ -913,6 +833,7 @@ class FedCastWorkflow:
                 is_validation_round=is_validation,
                 final_best_lfn=sub_best_lfn if is_final else None,
                 limit_train_sequences=limit,
+                gpu_tag=GPU_TAG,
             )
             yml_lfn = f"{method}_L{interval}_r{r:03d}.yml"
             yml_path = os.path.join(self.rounds_dir, yml_lfn)
@@ -925,8 +846,10 @@ class FedCastWorkflow:
                 _id=f"round_{method}_L{interval}_r{r:03d}",
                 node_label=f"round_{method}_L{interval}_r{r:03d}",
             )
+            # Same output directory as the parent (see __init__), so the
+            # collect_file bridge below finds the final checkpoint.
             subwf.add_args("--conf", self.subwf_conf,
-                           "--output-sites", "local")
+                           "--output-dir", self.local_storage_dir)
             subwf.add_inputs(File(prev_global))
             if not self.silos:
                 for site in self.sites:
@@ -1034,7 +957,7 @@ class FedCastWorkflow:
             )
             .add_inputs(self.benchmark_file, *seq_inputs)
             .add_outputs(forecasts, stage_out=False, register_replica=False)
-            .add_pegasus_profiles(label=tag)
+            .add_pegasus_profiles(label=tag, tag=gpu_tag_for("mct_infer"))
         )
         for site in self.sites:
             infer_job.add_args(
@@ -1148,6 +1071,112 @@ class FedCastWorkflow:
         self.wf.add_jobs(val_job)
 
 
+def check_site_catalog_setup(args, silos):
+    """Report where the site catalog comes from; abort if it cannot pin.
+
+    The generator writes no site catalog. Planning needs either a hosted
+    one (pegasus.catalog.site.repo.file in ~/.pegasusrc) or a local
+    sites.yml, and that is a warning either way — pegasus-plan fails
+    plainly when neither exists.
+
+    Cross-silo runs are different and abort here, because none of their
+    failure modes fail planning. A pinned job carries a tag and nothing
+    else, so a tag that is missing, pins nothing, names the wrong node,
+    or pins in a dialect this site's scheduler ignores all produce the
+    same outcome: the job runs wherever the scheduler likes, writes its
+    shard there, and the run continues as an emulated one that quietly
+    loses every later round's shard while still calling itself
+    cross-silo. Not being able to *tell* is refused for the same reason.
+    """
+    hosted, discovered = hosted_catalog()
+    hosted_copy = args.base_catalog or discovered
+    local = os.path.isfile(args.sites_yml)
+    if hosted:
+        logger.info(f"Site catalog: hosted {hosted} (~/.pegasusrc)"
+                    + (f" + {args.sites_yml} overlay" if local else ""))
+    elif local:
+        logger.info(f"Site catalog: {args.sites_yml}")
+    else:
+        logger.warning(
+            "No site catalog: set pegasus.catalog.site.repo.file in "
+            "~/.pegasusrc (hosted catalog, e.g. unity.yml) or write "
+            f"{args.sites_yml} with custom_sites.py --full before planning")
+
+    if not silos:
+        return
+    if args.skip_silo_tag_check:
+        logger.warning(
+            "--skip-silo-tag-check: not verifying that the silo tags exist. "
+            "Every pinned job must find its tag on site "
+            f"{args.execution_site_name!r} at plan time, or it runs "
+            "unpinned and the run is not cross-silo.")
+        return
+    if not local:
+        raise ValueError(
+            f"--silos needs the silo tags in {args.sites_yml}, which does "
+            f"not exist. The workflow pins a job only by tag "
+            f"(silo_<SITE>, silo_<SITE>_gpu); without them every pinned "
+            f"job runs wherever the scheduler likes and no shard stays "
+            f"put. Run:\n"
+            f"    ./custom_sites.py --style <condor|slurm> --silos "
+            f"{args.silos}\n"
+            f"(add --base <hosted catalog> or --gpu-queue so pinned GPU "
+            f"jobs keep the site's GPU settings), or pass "
+            f"--skip-silo-tag-check if the tags come from elsewhere.")
+
+    # No --style here: the site's own catalog says which scheduler it
+    # submits to, the local overlay first and then the hosted catalog it
+    # overlays, so a tag pointing at the wrong node, one carrying no pin,
+    # and a whole catalog written in the wrong dialect are all caught.
+    check = check_silo_tags(
+        args.sites_yml, args.execution_site_name, args.sites, silos,
+        base_catalog=hosted_copy)
+    if check.problems:
+        raise ValueError(
+            f"{len(check.problems)} silo tag problem(s) in "
+            f"{args.sites_yml} for site {args.execution_site_name!r} — "
+            f"those jobs would run unpinned or pinned to the wrong node:\n"
+            + "\n".join(check.problems)
+            + f"\nRun ./custom_sites.py --style <condor|slurm> --silos "
+              f"{args.silos} --sites {' '.join(args.sites)}, then "
+              f"tools/silo_check.py to check the pins themselves.")
+
+    if not check.verified and not args.allow_unverified_style:
+        # Fail closed, and note that a first run is exactly when this
+        # bites: an overlay states no submission style, so until the
+        # hosted catalog it overlays is at hand, a catalog written for
+        # the wrong scheduler is indistinguishable from a correct one and
+        # would plan cleanly here.
+        remedies = [
+            "point --base-catalog at the site catalog this overlays"
+            + (f", the hosted {hosted} — plan once and the planner leaves "
+               f"a copy in this directory, or fetch it from "
+               f"github.com/pegasushub/pegasus-site-catalogs"
+               if hosted else ""),
+            "write the whole compute site with custom_sites.py --full, "
+            "which states a submission style",
+            "pass --allow-unverified-style to accept the dialect as "
+            "given; presence, pins and node names are still checked",
+        ]
+        raise ValueError(
+            f"the silo tags in {args.sites_yml} name every mapped machine "
+            f"correctly, but which scheduler site "
+            f"{args.execution_site_name!r} submits to could not be "
+            f"confirmed: {check.note}. A pin in the other scheduler's "
+            f"dialect is ignored, so this cannot be passed as checked. "
+            f"Any of:\n" + "\n".join(f"  - {r}" for r in remedies))
+
+    logger.info(f"Silo tags: {2 * len(args.sites)} in {args.sites_yml}, "
+                f"each pinning its mapped machine for {check.note}")
+    if not check.verified:
+        logger.warning(
+            "--allow-unverified-style: the pins were checked against a "
+            "scheduler no site catalog confirmed. If this site does not "
+            "submit that way, every pinned job runs anywhere.")
+    logger.info(f"Check the pins against the pool with "
+                f"tools/silo_check.py --style <condor|slurm> {args.silos}")
+
+
 # ======================================================================
 # main()
 # ======================================================================
@@ -1161,18 +1190,35 @@ Examples:
   %(prog)s --start-month 2021-01 --months 48
   %(prog)s --start-month 2021-01 --months 48 --experiments e1 e21 e22
   %(prog)s --start-month 2021-01 --months 48 --silos silos.yml
+
+Then plan with the execution site from your site catalog (hosted catalogs
+call it "compute"):
+  pegasus-plan --submit -s compute --output-dir output workflow.yml
 """,
     )
 
     # --- Standard Pegasus arguments ---
-    parser.add_argument("-s", "--skip-sites-catalog", action="store_true",
-                        help="Skip site catalog creation")
     parser.add_argument("-e", "--execution-site-name", metavar="STR",
-                        type=str, default="condorpool",
-                        help="Execution site name (default: condorpool)")
+                        type=str, default="compute",
+                        help="Execution site to name in the printed "
+                             "pegasus-plan command (default: compute, the "
+                             "hosted site catalogs' convention). The "
+                             "workflow itself does not depend on it.")
     parser.add_argument("-o", "--output", metavar="STR", type=str,
                         default="workflow.yml",
                         help="Output file (default: workflow.yml)")
+    parser.add_argument("--sites-yml", metavar="FILE", type=str,
+                        default="sites.yml",
+                        help="local site-catalog overlay written by "
+                             "custom_sites.py (default: sites.yml). Named "
+                             "in the generated properties, so pegasus-plan "
+                             "finds it from any directory.")
+    parser.add_argument("--output-dir", metavar="DIR", type=str,
+                        default="output",
+                        help="Submit-host directory staged outputs land in "
+                             "(default: ./output). Plan the parent with the "
+                             "same --output-dir; FL-round sub-workflows use "
+                             "it automatically.")
 
     # --- Data / archive ---
     parser.add_argument("--start-month", type=str, default="2021-01",
@@ -1237,9 +1283,13 @@ Examples:
                              "with small nodes (e.g. 12 on 15.6 GB nodes)")
     parser.add_argument("--max-job-cores", type=int, default=2,
                         help="Core cap applied with --max-job-memory-gb")
-    parser.add_argument("--min-gpu-memory-mb", type=int, default=None,
-                        help="Require GPUs with at least this much VRAM "
-                             "(e.g. 20000 pins to RTX 6000 over T4)")
+    parser.add_argument("--runtime-scale", type=float, default=1.0,
+                        help="Multiply every job's wall-clock budget "
+                             "(default: 1.0; e.g. 2 on slow GPUs). Per-tag "
+                             "overrides belong in the site catalog.")
+    parser.add_argument("--retries", type=int, default=1,
+                        help="DAGMan retries per job; a retry doubles the "
+                             "job's runtime budget (default: 1)")
     parser.add_argument("--fallback-test-instances", type=int, default=0,
                         help="PILOT ONLY: mct_infer falls back to N test "
                              "sequences per site when no event matches")
@@ -1256,8 +1306,38 @@ Examples:
                              "per-client counts and losses). The centralized "
                              "baseline and evaluation still need shards "
                              "pooled, so each is copied out once by a "
-                             "silo_export job. Default: emulated placement, "
-                             "as in the paper.")
+                             "silo_export job. The pins themselves live in "
+                             "the site catalog: run custom_sites.py --silos "
+                             "with the same map first. Default: emulated "
+                             "placement, as in the paper.")
+
+    parser.add_argument("--shared-filesystem", action="store_true",
+                        help="the workers can read the submit host's "
+                             "filesystem, as on an HPC cluster with a "
+                             "shared home or scratch. Lets jobs read "
+                             "inputs directly from the input site instead "
+                             "of staging every copy through the staging "
+                             "server, which matters most for the "
+                             "multi-GB container images. Leave off for a "
+                             "condor pool that stages over HTCondor file "
+                             "transfer.")
+    parser.add_argument("--base-catalog", metavar="FILE", default=None,
+                        help="the site catalog your sites.yml overlays, "
+                             "read to confirm which scheduler the site "
+                             "submits to (default: the hosted catalog "
+                             "named in ~/.pegasusrc, if the planner has "
+                             "left a copy in this directory). Needed with "
+                             "--silos, since an overlay states no style "
+                             "and a pin in the wrong dialect is ignored.")
+    parser.add_argument("--allow-unverified-style", action="store_true",
+                        help="with --silos: accept silo pins whose dialect "
+                             "no site catalog could confirm. Presence, "
+                             "pins and node names are still checked.")
+    parser.add_argument("--skip-silo-tag-check", action="store_true",
+                        help="with --silos: do not require the silo tags in "
+                             "the local site catalog. Only correct if they "
+                             "come from somewhere else (a forked hosted "
+                             "catalog); otherwise pinned jobs run anywhere.")
 
     # --- Pilot mode ---
     parser.add_argument("--test", action="store_true",
@@ -1308,7 +1388,14 @@ Examples:
     logger.info(f"Experiments: {args.experiments}")
     logger.info(f"Training budget: {args.rounds} rounds/epochs in segments "
                 f"of {args.segment_size}")
-    logger.info(f"Execution site: {args.execution_site_name}")
+    logger.info(f"Runtime budgets x{args.runtime_scale}, "
+                f"{args.retries} retr{'y' if args.retries == 1 else 'ies'}")
+    logger.info("Input staging: "
+                + ("direct from the input site (--shared-filesystem)"
+                   if args.shared_filesystem else
+                   "through the staging server; pass "
+                   "--shared-filesystem on a cluster whose workers can "
+                   "read the submit host"))
     if args.silos:
         logger.info(f"Placement: CROSS-SILO ({args.silos})")
     else:
@@ -1318,12 +1405,9 @@ Examples:
     try:
         workflow = FedCastWorkflow(args)
         workflow.log_placement()
+        check_site_catalog_setup(args, workflow.silos)
         workflow.create_pegasus_properties()
-        if not args.skip_sites_catalog:
-            workflow.create_sites_catalog(
-                exec_site_name=args.execution_site_name)
-        workflow.create_transformation_catalog(
-            exec_site_name=args.execution_site_name)
+        workflow.create_transformation_catalog()
         workflow.create_replica_catalog()
         workflow.write_subworkflow_conf()
         workflow.create_workflow()
@@ -1331,7 +1415,9 @@ Examples:
 
         logger.info(f"\nWorkflow written to {args.output}")
         logger.info(f"Submit: pegasus-plan --submit "
-                    f"-s {args.execution_site_name} -o local {args.output}")
+                    f"-s {args.execution_site_name} "
+                    f"--output-dir {workflow.local_storage_dir} "
+                    f"{args.output}")
     except ValueError as e:
         # Silo-map problems are user configuration, not bugs.
         logger.error(str(e))

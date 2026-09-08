@@ -43,24 +43,41 @@ Phase E  ablations         E2.1 quadratic client weighting; E2.2 SAM (TODO)
 
 ## Quick start
 
+Needs Pegasus 5.1.3dev or 6.0.0dev
+([download](https://download.pegasus.isi.edu/pegasus/6.0.0.dev0/)): the
+workflow relies on job tags and hosted site catalogs, which older releases
+do not have. Install the matching `pegasus-wms` Python package into the
+virtualenv you generate from.
+
 ```sh
 # 1. Build containers (once)
 apptainer build Apptainer/FedCast_data.sif  Apptainer/FedCast_data.def
 apptainer build Apptainer/FedCast_train.sif Apptainer/FedCast_train.def
 apptainer build Apptainer/FedCast_eval.sif  Apptainer/FedCast_eval.def
 
-# 2. Pilot run (2 sites, 1 month, 2 rounds — end-to-end smoke test)
+# 2. Tell Pegasus where jobs run — once per submit host. On a cluster with
+#    a hosted site catalog (Unity, Perlmutter, Expanse, ...) this is one
+#    line; see "Sites" below for pools without one.
+cat >> ~/.pegasusrc <<EOF
+pegasus.catalog.site.repo.file = unity.yml
+EOF
+./custom_sites.py --style slurm --project <your allocation>
+
+# 3. Pilot run (2 sites, 1 month, 2 rounds — end-to-end smoke test)
 python3 workflow_generator.py --test
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --submit -s compute --output-dir output workflow.yml
 
-# 3. Full E1 reproduction
+# 4. Full E1 reproduction
 python3 workflow_generator.py --start-month 2021-01 --months 48
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --submit -s compute --output-dir output workflow.yml
 
-# 4. With ablations
+# 5. With ablations
 python3 workflow_generator.py --start-month 2021-01 --months 48 \
     --experiments e1 e21 e22
 ```
+
+`compute` is the execution site's name in every hosted catalog; the
+generator prints the exact `pegasus-plan` line for your `--output-dir`.
 
 Or run the wrappers directly without Pegasus/HTCondor:
 
@@ -81,8 +98,81 @@ Or run the wrappers directly without Pegasus/HTCondor:
 | `--experiments` | e1 | Pools: `e1`, `e21` (quadratic), `e22` (SAM) |
 | `--min-rain-fraction` | 0.05 | Sequence retention filter (open question 2) |
 | `--frame-stride` | 1 | Subsample MRMS cadence (pilot runs) |
+| `--shared-filesystem` | — | Workers can read the submit host; skip staging inputs |
+| `--runtime-scale` | 1.0 | Multiply every job's wall-clock budget |
+| `--retries` | 1 | DAGMan retries per job; a retry doubles the budget |
+| `--output-dir` | `output` | Where staged-out files land; plan with the same |
 | `--test` | — | Pilot mode: 2 sites, 1 month, 2 rounds |
 | `--silos` | — | Cross-silo placement map (see below) |
+| `--base-catalog` | hosted copy | Catalog your `sites.yml` overlays, read to confirm the pin dialect |
+| `--allow-unverified-style` | — | Accept silo pins whose dialect no catalog confirmed |
+
+## Sites
+
+The generator writes no site catalog and names no scheduler. Every
+transformation states the four portable things — cores, memory, GPUs and a
+wall-clock `runtime` (mandatory on batch systems) — and GPU jobs carry the
+Pegasus tag `gpu`. Everything else about *where* a job runs and *how* it
+asks for resources — partition, account, GPU model constraints, ClassAd
+requirements, `--nodelist` — lives in the site catalog, keyed by tag, which
+is what makes the same `workflow.yml` plan on an HTCondor pool and on Unity.
+
+**With a hosted catalog.** Pegasus downloads the catalog named by
+`pegasus.catalog.site.repo.file` in `~/.pegasusrc` from
+[pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf)
+and merges a local `sites.yml`, if present, over it — local entries win key
+by key, and `x-tags` merge the same way. `unity.yml`, for instance, already
+puts CPU jobs on `queue: cpu` and defines a `gpu` tag with `queue: gpu`,
+`gpus: 1` and `--nv`. What you add is what the catalog cannot know:
+
+```sh
+./custom_sites.py --style slurm --project my_lab            # account
+# and generate with --shared-filesystem on a cluster like Unity
+./custom_sites.py --style slurm --project my_lab \
+    --gpu pegasus:glite.arguments=--constraint=vram48        # GPU model
+```
+
+**Without one** (a personal HTCondor pool, a Slurm cluster nobody has
+catalogued), `--full` writes the whole compute site:
+
+```sh
+./custom_sites.py --style condor --full \
+    --gpu 'condor:requirements=(GPUs_GlobalMemoryMb >= 20000)'
+./custom_sites.py --style slurm --full --queue cpu --gpu-queue gpu \
+    --project my_lab --scratch /scratch/$USER/fedcast
+```
+
+`custom_sites.py` is a thin wrapper over the Pegasus API; anything it does
+not have a flag for goes in as `--profile NS:KEY=VALUE` on the site or
+`--gpu NS:KEY=VALUE` on the GPU tag, or edit `sites.yml` by hand. It is a
+starting point — the
+[alphafold3-workflow](https://github.com/baldikacti/alphafold3-workflow)
+shows the same pattern at its smallest.
+
+On a cluster whose workers can read the submit host, `--shared-filesystem`
+sets `pegasus.transfer.bypass.input.staging`, so jobs read inputs directly
+instead of staging every copy through the staging server. That matters
+most for the three container images, which are several GB each. It is off
+by default and must stay off on a condor pool that stages over HTCondor
+file transfer, where the workers cannot reach the submit host's paths and
+jobs would chase `file://` URLs that do not exist there.
+`pegasus.transfer.links` is always set, and only takes effect when the
+replica catalog places an input on the execution site itself, so it costs
+nothing where it does not apply.
+
+Runtime budgets are generous defaults for full-scale inputs (six hours for
+a month of MRMS, twelve for a ten-epoch centralized segment, two for one
+client's local epoch) and are doubled on retry through a `runtime.expr`
+profile; `--runtime-scale` multiplies them all. Sizes (memory, cores,
+runtime, GPU count) are workflow knobs because transformation-catalog
+profiles outrank the site catalog in Pegasus; what a tag controls is how
+the request is expressed and where it lands — partition, account,
+constraints, pins. Retry rewriting needs the `pythonsed` package on the
+submit host.
+
+Nothing here is HTCondor-specific any more, but the pool this has actually
+run to completion on is a personal HTCondor pool (`--style condor --full`).
+The first Slurm run should be the pilot (`--test`).
 
 ## Data placement: emulated vs. cross-silo
 
@@ -90,11 +180,15 @@ The paper *emulates* federation: all seven clients are carved out of one
 central MRMS archive, and the figure caption notes that the server icon
 "denotes a server-side role, not an actual deployment location". The
 default mode here matches that. Client shards are ordinary Pegasus files,
-HTCondor matches each training job to any free GPU slot, and the shard is
-staged to whichever worker won the match, every round.
+the scheduler places each training job on any free GPU slot, and the shard
+is staged to whichever worker won the match, every round.
 
 `--silos silos.yml` switches to a real cross-silo model, where each client
-is a data holder and **the federated arm never moves its shard**:
+is a data holder and **the federated arm never moves its shard**. The
+generator expresses this as a Pegasus tag per pinned job — `silo_KTLX` for
+CPU work at that silo, `silo_KTLX_gpu` for GPU work — and
+`custom_sites.py --silos` gives those tags their meaning on your scheduler,
+so the workflow itself stays scheduler-neutral:
 
 | | emulated (default) | cross-silo (`--silos`) |
 |---|---|---|
@@ -222,38 +316,107 @@ paper does the same.
 ### Setting it up
 
 ```sh
-cp silos.example.yml silos.yml    # put your own machine names in
-tools/silo_check.py silos.yml     # confirm the pool matches
+cp silos.example.yml silos.yml                  # your own machine names
+# Fetch the hosted catalog once, so the pin dialect can be verified. The
+# planner also leaves a copy here after any plan.
+curl -O https://raw.githubusercontent.com/pegasushub/pegasus-site-catalogs/main/conf/unity.yml
+./custom_sites.py --style slurm --base unity.yml --silos silos.yml   # tags
+tools/silo_check.py --style slurm silos.yml     # confirm the cluster matches
 python3 workflow_generator.py --start-month 2021-01 --months 48 \
-    --silos silos.yml
-pegasus-plan --submit -s condorpool -o local workflow.yml
+    --silos silos.yml --base-catalog unity.yml
+pegasus-plan --submit -s compute --output-dir output workflow.yml
 ```
 
-That is the whole procedure. Nothing has to be installed or configured on
-the workers, because the defaults avoid needing it:
+(`--style condor` throughout on an HTCondor pool; drop `--base` if you have
+no hosted catalog and pass `--full` plus your GPU settings instead.) That
+is the whole procedure. Nothing has to be installed or configured on the
+workers, because the defaults avoid needing it:
 
-- **Pinning by machine name** uses HTCondor's built-in `Machine` attribute,
-  so no ClassAd has to be advertised and no `condor_reconfig` is needed.
-  Get the names from `condor_status -af Machine`.
+- **Pinning by machine name** uses a name the scheduler already knows —
+  `condor_status -af Machine` on HTCondor, `sinfo -N` on Slurm — so
+  nothing has to be advertised. On HTCondor the tag becomes a
+  `requirements` expression; on Slurm, `--nodelist=` in the job's glite
+  arguments.
 - **A home-relative shard directory** (`~/.fedcast/silos`, the default) is
   inside Apptainer's default mounts, so nothing is bind-mounted and the
   preprocess job creates its own directory on first use.
 
-The home-relative default assumes every job on a worker runs as the same
-user, which is true of an ordinary pool but not of one configured with
-per-slot users. There the preprocess and training jobs would resolve
-different directories. `silo_check.py` queries each matched worker and says
-so, and an absolute shard directory is the fix. Do not point the directory
-at `/tmp` or `/var/tmp`: HTCondor defaults `MOUNT_UNDER_SCRATCH` to those
-two, making them private per job and deleting them when the job ends, so
-the shard would be gone before the next round. The generator warns if you
-try.
+A job carries exactly one tag, which is why each silo gets two: the GPU one
+has to say everything the plain `gpu` tag says (partition, `gpus`, `--nv`,
+any constraint) *and* the pin. `custom_sites.py --base <hosted catalog>`
+copies the hosted `gpu` tag as the starting point — the planner leaves a
+copy of the catalog in the working directory — and appends the pin to
+whatever key it lands on, so `-C gpu --nodelist=node7` on Perlmutter and
+`(GPUs_GlobalMemoryMb >= 20000) && (Machine == "w1")` on HTCondor both
+come out right. Without `--base` or `--gpu-queue` on Slurm it warns, because
+pinned training would then land in the default partition.
 
-`silo_check.py` runs the exact requirements expression each client's jobs
-will carry and prints the machines it matches, so a wrong name fails in a
-second rather than as an idle job hours later. It then reads each matched worker's
+The home-relative default assumes every job on a machine runs as the same
+user, which is true of a Slurm cluster and of an ordinary HTCondor pool
+but not of one configured with per-slot users. There the preprocess and
+training jobs would resolve different directories. On HTCondor
+`silo_check.py` queries each matched worker and says so, and an absolute
+shard directory is the fix. Do not point the directory at `/tmp` or
+`/var/tmp`: HTCondor defaults `MOUNT_UNDER_SCRATCH` to those two, and
+Slurm sites commonly enable `job_container/tmpfs`, either of which makes
+them private per job and deletes them when the job ends, so the shard
+would be gone before the next round. The generator, `custom_sites.py` and
+`silo_check.py` all warn if you try.
+
+One thing to be clear-eyed about on a cluster with a shared home: every
+node sees `~/.fedcast/silos`, so pinning there decides where a job *runs*,
+not what it *can read*. If the point of your run is that a shard is
+readable only at its holder, put `data_dir` on node-local storage.
+
+`workflow_generator.py --silos` refuses to write a workflow unless every
+client's two tags are present in the site catalog *and* actually pin.
+Four ways that fails, all of them refusals:
+
+- the tag is absent;
+- it exists but carries no pin at all, which is what a tag copied for its
+  queue and GPU settings looks like;
+- its pin names something other than the one machine the map gives;
+- it pins in the other scheduler's dialect. A `requirements` ClassAd does
+  not place a job on a Slurm node, and `glite.arguments` does nothing in a
+  vanilla HTCondor pool, so a pin in the wrong dialect is no pin at all.
+
+Which scheduler the site submits to is read from the site catalog, the
+local overlay first and then the hosted catalog it overlays. That last
+step matters more than it sounds: an overlay states no style of its own,
+so a catalog written entirely for the wrong scheduler agrees with itself
+and passes every other check.
+
+The hosted copy is the one the planner leaves in the working directory, so
+on a first run there may be nothing to read it from — and that is refused
+too, rather than warned about, because an unverifiable dialect is the same
+silent outcome as a wrong one. Three ways past it: point
+`--base-catalog` at the catalog your overlay overlays, write the whole
+site with `custom_sites.py --full`, which states a style, or pass
+`--allow-unverified-style` to accept the dialect as given, which still
+checks presence, pins and node names. `custom_sites.py` also refuses a
+`--style` contradicting the catalog it is handed, the earliest point the
+mistake can be caught.
+
+It has to be a refusal rather than a warning, because a pinned job carries
+a tag and nothing else. An unpinned tag does not fail planning. It makes
+the job run wherever the scheduler likes, write its shard there, and take
+the run quietly back to emulated placement while still calling itself
+cross-silo.
+
+Pins are compared by parsing, not by substring, because
+`--nodelist=node7` is a substring of `--nodelist=node70`; a nodelist
+naming several nodes or a bracket range is rejected for the same reason a
+silo may not span two machines. `--skip-silo-tag-check` overrides all of
+this, for tags that genuinely come from somewhere else.
+
+`silo_check.py` repeats those checks and adds the pool. It runs the exact
+requirements expression each client's jobs will carry and prints the
+machines it matches (HTCondor), or asks `scontrol` whether each named node
+exists (Slurm), so a wrong name fails in a second rather than as an idle
+job hours later. On HTCondor it then reads each matched worker's
 configuration and checks the two ways a shard directory fails to survive
-the round, described below.
+the round, described below; Slurm has no remote config query, so there
+that section is reported as unverified.
 
 A worker whose configuration cannot be read is reported as unverified
 rather than counted as fine, and that has its own exit status so
@@ -262,14 +425,17 @@ cannot mistake an unchecked pool for a clean one:
 
 | Exit | Meaning |
 |---|---|
-| 0 | every matched worker was checked and is fine |
-| 1 | a real problem: a silo matches no worker, a worker cannot satisfy the bind, or a shard directory would not survive the round |
+| 0 | every check ran and is fine |
+| 1 | a real problem: a silo tag missing or mispinned, a silo matching no worker, a worker that cannot satisfy the bind, or a shard directory that would not survive the round |
 | 2 | the tool could not run: bad arguments, `condor_status` missing, or an unusable silo map |
-| 3 | placement is fine, durability unverified on at least one worker |
+| 3 | placement is fine, but something could not be verified: shard durability on a worker whose config could not be read, or the pin dialect when no site catalog states the site's scheduler |
 
 Pools that deliberately refuse remote config queries always get 3. Pass
 `--allow-unverified` there to accept it and exit 0; placement and bind
 checks still have to pass, and a real durability problem still exits 1.
+An unverified pin dialect is a separate opt-in, `--allow-unverified-style`,
+so a script already carrying `--allow-unverified` for a quiet pool does
+not thereby start accepting pins whose scheduler nothing confirmed.
 
 If a shard does go missing at run time, the job says so with the worker,
 the job user, and the resolved `HOME`, and each client's manifest records
@@ -294,14 +460,17 @@ sudo tools/silo_worker_setup.sh KTLX,KVNX /var/lib/fedcast/silos  # holders
 sudo tools/silo_worker_setup.sh none      /var/lib/fedcast/silos  # the rest
 ```
 
-`silo_check.py` verifies this pool-wide and names any worker that would
-fail. It skips the check entirely when the map needs no bind.
+On HTCondor `silo_check.py` verifies this pool-wide and names any worker
+that would fail; it skips the check entirely when the map needs no bind.
+On Slurm the script does not apply (it writes HTCondor configuration) —
+create the directory on every node yourself.
 
 **Pinning by advertised ClassAd** instead of machine name, written as `{}`
-entries in the map. Useful when you would rather not hardcode hostnames or
-want a silo to match any of several machines. Run the setup script on each
-data holder with the silos it hosts; it writes the ClassAd and reconfigures
-the startd.
+entries in the map, or by a raw `requirements:` expression. HTCondor only;
+`custom_sites.py` rejects both for Slurm. Useful when you would rather not
+hardcode hostnames or want a silo to match any of several machines. Run
+the setup script on each data holder with the silos it hosts; it writes
+the ClassAd and reconfigures the startd.
 
 Pegasus cannot take over either step for you. Its own symlinking-in-
 containers support has the same requirement, documented in the Pegasus
@@ -321,12 +490,13 @@ reads only its own shard.
 
 Pinning trades scheduling freedom for locality, so size the pool by GPU
 slots rather than worker count. Seven clients pinned onto two GPU workers
-run their rounds in waves, not in parallel, and `--min-gpu-memory-mb`
-narrows the match further by excluding cards too small for the configured
-`--model-size`. Check what each silo actually matched in `silo_check.py`
-output before committing to a long run.
+run their rounds in waves, not in parallel, and a GPU constraint on the
+`gpu` tag (`custom_sites.py --gpu ...`) narrows the match further by
+excluding cards too small for the configured `--model-size`. Check what
+each silo actually matched in `silo_check.py` output before committing to
+a long run.
 
-## Outputs (staged to `output/`)
+## Outputs (staged to `--output-dir`, default `output/`)
 
 - `{site}_manifest.json` — frozen split manifests with SHA-256 (Tier 0/1).
   In cross-silo runs each also records where the shard landed and which
@@ -338,34 +508,40 @@ output before committing to a long run.
 - `figures.tar.gz` — learning-curve plots + summary table
 - `validation_report.md` — SPEC Sec. 5 gate results
 
-## Running on another pool
+## Running on another cluster
 
-Nothing in the repository hard-codes a host or a path: catalogs,
-properties, and the FL-round sub-workflow YAMLs are all generated from the
-directory the generator runs in, and they are gitignored. To run this
-somewhere else:
+Nothing in the repository hard-codes a host, a path or a scheduler:
+catalogs, properties, and the FL-round sub-workflow YAMLs are all generated
+from the directory the generator runs in, and they are gitignored. To run
+this somewhere else:
 
 1. Clone the repo on the submit host and `pip install -r requirements.txt`
-   into a virtualenv.
+   into a virtualenv (Pegasus 5.1.3dev / 6.0.0dev on the host and in the
+   venv).
 2. Build the three Apptainer images (Quick start step 1). They are large
    and not in git.
-3. Run `workflow_generator.py`, which writes `sites.yml`,
-   `transformations.yml`, `pegasus.properties`, and `fl_subwf.properties`
-   for that host.
-4. If the pool's nodes are small, cap requests with `--max-job-memory-gb`
-   and `--max-job-cores`; if it mixes GPU models, set
-   `--min-gpu-memory-mb` so training does not land on a card too small
-   for the configured `--model-size`.
-5. For cross-silo runs, copy `silos.example.yml`, put the new pool's
-   machine names in it, and run `tools/silo_check.py` before planning. The
-   defaults need nothing installed or configured on the workers; see
+3. Point `~/.pegasusrc` at the cluster's hosted site catalog, or write a
+   complete one with `custom_sites.py --full`; add your account and any
+   GPU constraint with `custom_sites.py` either way ([Sites](#sites)).
+4. Run `workflow_generator.py`, which writes `transformations.yml`,
+   `pegasus.properties`, and `fl_subwf.properties` for that host, then
+   plan with `--output-dir` as it prints.
+5. If the nodes are small, cap requests with `--max-job-memory-gb` and
+   `--max-job-cores`; if jobs hit their wall-clock limit, raise
+   `--runtime-scale`.
+6. For cross-silo runs, copy `silos.example.yml`, put the new cluster's
+   machine names in it, run `custom_sites.py --silos` to write the tags,
+   and `tools/silo_check.py --style ...` before planning. The defaults
+   need nothing installed or configured on the workers; see
    [When worker setup is needed](#when-worker-setup-is-needed) for the two
    cases that do.
 
-Worker packages are configured for containers whose OS differs from the
-submit host (`pegasus.transfer.worker.package.strict=false`), which the
-sub-workflow properties repeat because FL rounds are planned with their
-own configuration file, not the parent's.
+The sub-workflow properties repeat everything in `pegasus.properties`
+(worker-package settings for containers whose OS differs from the submit
+host, the hosted-catalog selection from `~/.pegasusrc`, the path to a
+local `sites.yml`) because FL rounds are planned with their own
+configuration file, not the parent's. Re-run the generator after changing
+`~/.pegasusrc` or writing a new `sites.yml`.
 
 ## Known gaps (scaffold state)
 

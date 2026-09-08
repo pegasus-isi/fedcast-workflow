@@ -92,8 +92,14 @@ gated on E1 completion (they reuse E1 data and benchmark artifacts).
 
 ```
 fedcast-workflow/
-├── workflow_generator.py      # Pegasus DAG generator (Pegasus.api)
+├── workflow_generator.py      # Pegasus DAG generator (Pegasus.api); states
+│                              # cores/memory/gpus/runtime + a tag per job,
+│                              # never a scheduler
 ├── fl_round.py                # builder for one FL-round SubWorkflow
+├── custom_sites.py            # writes sites.yml: account, partition, GPU
+│                              # constraints and silo pins, per scheduler
+├── silo_map.py                # silo map parsing + tag names + pins, shared
+│                              # by the generator, custom_sites, silo_check
 ├── silos.example.yml          # cross-silo placement map template (§6 Q12)
 ├── bin/                       # job wrappers, staged to the workers
 │   ├── fedcast_common.py      # shared model/data helpers for the fl_* jobs
@@ -119,8 +125,9 @@ fedcast-workflow/
 │   ├── check_export_docs.py   # fails if a silo job exports an undocumented field
 │   ├── test_validation_equivalence.py  # runs both validation wrappers, checks
 │   │                          # they agree (stub model, CPU, seconds)
-│   ├── silo_check.py          # cross-silo preflight (placement + durability)
-│   ├── silo_worker_setup.sh   # worker prep, only for non-default silo maps
+│   ├── silo_check.py          # cross-silo preflight (tags, placement,
+│   │                          # durability); HTCondor or Slurm
+│   ├── silo_worker_setup.sh   # HTCondor worker prep, non-default maps only
 │   └── timing_extrapolate.py  # project full-study wall-clock from a run dir
 ├── Apptainer/                 # FedCast_{data,train,eval}.def
 ├── run_manual.sh              # tiny end-to-end smoke test without Pegasus
@@ -209,7 +216,10 @@ image the jobs run is the one on the submit host.
 
 1. **Wall-clock time, GPU model, node count, site placement.** The budget is matched
    in epochs/rounds, not hardware. Any CUDA-capable site (Chameleon, FABRIC, local
-   HTCondor pool) is acceptable.
+   HTCondor pool, a Slurm cluster such as Unity) is acceptable. The generator
+   therefore states only cores, memory, GPUs and a wall-clock runtime per job and
+   tags GPU jobs `gpu`; partition, account, GPU constraints and pins come from the
+   site catalog (hosted, plus `custom_sites.py`), never from the workflow.
 2. **Geographic distribution of clients.** The paper itself *emulates* federation
    from a common MRMS archive (Sec. III-B; Fig. 1's caption states the server icon
    "denotes a server-side role, not an actual deployment location"), so running all
@@ -395,8 +405,8 @@ framing.
 
 12. **Client data placement.** ~~The per-round SubWorkflow structure gives each
     client its own job, but nothing made a client's shard *stay* anywhere: shards
-    were built centrally and re-staged to whatever worker HTCondor matched, every
-    round, and `fl_validate` read every client's validation split on one node.
+    were built centrally and re-staged to whatever worker the scheduler matched,
+    every round, and `fl_validate` read every client's validation split on one node.
     That is emulated FL, not cross-silo FL.~~ **RESOLVED (2026-09-05): both models
     are supported, emulated by default.**
 
@@ -405,9 +415,21 @@ framing.
     - `preprocess_sequences` runs pinned to the client's silo and writes the shard
       into an on-worker directory (`--silo-dir`). The shard is not a Pegasus file,
       so nothing can stage it implicitly.
-    - `fl_train_client` and the new `fl_validate_client` carry the silo's HTCondor
-      requirements expression and read the resident shard in place. No federated
-      job moves the shard; what those jobs do return, besides the model weights,
+    - `fl_train_client` and the new `fl_validate_client` carry the silo's GPU tag
+      (`silo_<SITE>_gpu`; CPU-side `preprocess_sequences` and `silo_export` carry
+      `silo_<SITE>`) and read the resident shard in place. The tag is the whole of
+      what the workflow says; `custom_sites.py --silos` writes what it means on the
+      pool — an HTCondor `requirements` expression or a Slurm `--nodelist` — into
+      the site catalog's `x-tags`, so the workflow itself names no scheduler
+      (2026-09-08, on review feedback that the original ClassAd pinning could not
+      run on Unity). Moving the pin out of the workflow makes an absent or wrong
+      tag a *silent* loss of pinning rather than a planning failure, so
+      `--silos` refuses to plan unless every tag is present and pins the mapped
+      machine in this site's own scheduler dialect; pins are compared by parsing,
+      since `--nodelist=node7` is a substring of `--nodelist=node70`.
+      `--skip-silo-tag-check` overrides, for tags that come from elsewhere. A job carries one tag, so the GPU tag also has to restate the
+      site's GPU settings; `custom_sites.py --base <hosted catalog>` copies them.
+      No federated job moves the shard; what those jobs do return, besides the model weights,
       is small per-client metadata — `n_train` from training (the aggregator
       needs it for the Eq. 8 quadratic-weighting ablation) and
       `n_val`/`n_batches`/loss sum and mean from validation.
@@ -484,7 +506,8 @@ framing.
       takes `fedcast_common.py` as an input, which is the only DAG change: two
       extra staged-input entries per site in the pilot.
     - **No worker-side setup is needed for the default map.** Silos pin by
-      HTCondor's built-in `Machine` attribute (nothing to advertise, no
+      machine name, which the scheduler already knows (HTCondor's `Machine`
+      attribute, Slurm's node name — nothing to advertise, no
       `condor_reconfig`), and the default shard directory `~/.fedcast/silos` is
       inside the job user's home, which Apptainer mounts, so nothing is
       bind-mounted and the preprocess job creates its own directory. Shard
@@ -499,10 +522,12 @@ framing.
       queries `SLOT_USER` per matched worker and says so, and an absolute
       `data_dir` is the fix. `/tmp` and `/var/tmp` are explicitly NOT usable
       despite Apptainer mounting them: HTCondor defaults `MOUNT_UNDER_SCRATCH`
-      to `/tmp,/var/tmp`, making both private per job and deleting them at job
-      end, so a shard there would not survive to the next round. The generator
-      warns on such a `data_dir` (matching the directory itself as well as
-      anything under it) and `silo_check.py` checks it per worker, reporting a
+      to `/tmp,/var/tmp` and Slurm sites commonly enable `job_container/tmpfs`,
+      making both private per job and deleting them at job end, so a shard
+      there would not survive to the next round. The generator warns on such a
+      `data_dir` (matching the directory itself as well as anything under it)
+      and `silo_check.py` checks it per worker on HTCondor (Slurm has no remote
+      config query, so there it is reported as unverified), reporting a
       worker whose config cannot be read as unverified rather than as fine —
       with its own exit status (3, vs 1 for a real problem) so
       `silo_check.py && pegasus-plan` is safe by default and an unchecked pool
@@ -518,11 +543,18 @@ framing.
     - Two departures still need `tools/silo_worker_setup.sh`: an absolute
       `data_dir` elsewhere (Pegasus scopes `container.arguments` to the catalog,
       not the job, so it is bind-mounted pool-wide and EVERY worker needs it —
-      `silo_worker_setup.sh none`), and ClassAd pinning (`{}` entries). Pegasus
+      `silo_worker_setup.sh none`), and ClassAd pinning (`{}` or `requirements:`
+      entries, HTCondor only — `custom_sites.py` rejects them for Slurm). Pegasus
       cannot own either: its own symlinking-in-containers support has the same
       requirement that the host directory pre-exist and be named in the
-      container's `mounts`. `tools/silo_check.py` resolves every silo against
-      `condor_status` and, only when the map needs a bind, checks it pool-wide.
+      container's `mounts`. `tools/silo_check.py` first checks `sites.yml` carries
+      both tags per client with pins matching the map, then resolves every silo
+      against `condor_status` (or `scontrol show node` on Slurm) and, only when
+      the map needs a bind, checks it pool-wide on HTCondor.
+    - On a cluster whose home is a shared filesystem every node can read every
+      shard, so pinning there fixes where a job runs rather than what it can
+      read; a run that wants shards readable only at their holder puts
+      `data_dir` on node-local storage. Documented in README and the map.
 
     Deliberately out of scope: **ingest is still shared** (one fetch job per
     (domain, month) crops for all clients in that domain, since per-silo ingest

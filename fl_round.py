@@ -13,15 +13,16 @@ Each federated round of Fed-Cast is its own sub-DAG (paper Sec. IV-C.2):
 Two placement models, selected by the caller through the client specs:
 
   emulated (default)   client shards are Pegasus files staged to whatever
-                       worker HTCondor matches, and fl_validate scores all
-                       clients' validation splits itself. Faithful to the
-                       paper, which emulates federation from a common MRMS
-                       archive (paper Sec. III-B, Fig. 1 caption).
+                       worker the scheduler picks, and fl_validate scores
+                       all clients' validation splits itself. Faithful to
+                       the paper, which emulates federation from a common
+                       MRMS archive (paper Sec. III-B, Fig. 1 caption).
 
-  cross-silo (--silos) each client dict carries a "requirements" ClassAd
-                       expression and absolute on-worker paths. The shard
-                       is never staged: the training job is pinned to the
-                       silo holding it and reads it in place, and
+  cross-silo (--silos) each client dict has resident=True, absolute
+                       on-worker paths, and a "tag" naming the silo's GPU
+                       tag in the site catalog (silo_map.silo_tags). The
+                       shard is never staged: the training job is pinned
+                       to the silo holding it and reads it in place, and
                        validation fans out to pinned fl_validate_client
                        jobs that return per-client loss sums and counts.
                        Nothing in this sub-workflow moves a shard, though
@@ -31,6 +32,11 @@ Two placement models, selected by the caller through the client specs:
                        arms outside it get one silo_export copy per
                        client. See "Data placement" in README.md for the
                        full list of what leaves a silo.
+
+Resource needs are not stated here beyond a Pegasus tag per job: the
+transformation catalog carries cores/memory/gpus/runtime, and the site
+catalog's x-tags map each tag to whatever the pool needs (queue,
+partition, constraints, pin). That keeps this file scheduler-agnostic.
 
 Imported by workflow_generator.py, which writes the returned Workflow to a
 YAML file, registers it in the replica catalog, and adds a SubWorkflow job
@@ -43,17 +49,17 @@ COMMON_LFN = "fedcast_common.py"
 
 
 def _place_client_job(job, client):
-    """Pin a client job to its silo, or leave it free-floating.
+    """Tag a client job for its silo, or declare its staged inputs.
 
     In cross-silo mode the client's shard is resident on the silo worker,
-    so the job carries an HTCondor requirements expression instead of
-    declaring the shard as a staged input. In emulated mode the shard is
-    a normal Pegasus file and is declared as an input here.
+    so the job carries the silo's GPU tag (which the site catalog turns
+    into a node pin plus the site's GPU settings) instead of declaring the
+    shard as a staged input. In emulated mode the shard is a normal
+    Pegasus file, declared as an input here, and the job carries the plain
+    GPU tag.
     """
-    if client.get("requirements"):
-        job.add_profiles(Namespace.CONDOR, "requirements",
-                         client["requirements"])
-    else:
+    job.add_pegasus_profile(tag=client["tag"])
+    if not client.get("resident"):
         job.add_inputs(File(client["sequences"]),
                        File(client["manifest"]))
 
@@ -93,6 +99,7 @@ def generate_round_workflow(
     is_validation_round,
     final_best_lfn=None,        # set on the final round only
     limit_train_sequences=None,  # pilot/CPU smoke tests only
+    gpu_tag="gpu",              # site-catalog tag for unpinned GPU jobs
 ):
     """Build the sub-DAG for one FL round.
 
@@ -196,10 +203,11 @@ def generate_round_workflow(
             .add_outputs(history_out, stage_out=True,
                          register_replica=False)
             .add_outputs(best_out, stage_out=True, register_replica=False)
+            .add_pegasus_profile(tag=gpu_tag)
         )
         val_client_jobs = []
         for client in clients:
-            if not client.get("requirements"):
+            if not client.get("resident"):
                 # Emulated: the server reads this client's split itself.
                 val_job.add_args(
                     "--client",

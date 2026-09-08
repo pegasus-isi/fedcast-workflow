@@ -12,7 +12,7 @@ centrally (fedcast_common.generator_val_loss), so the checkpoint rule
 (SPEC.md constraint 9) is unchanged.
 
 Runs inside the FL-round SubWorkflow on validation rounds only, pinned to
-the client's silo worker via HTCondor requirements (see silos.example.yml).
+the client's silo worker via its site-catalog tag (see silos.example.yml).
 """
 
 import argparse
