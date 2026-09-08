@@ -207,6 +207,46 @@ def read_site_tags(path, site_name):
     return read_site_entry(path, site_name)[1]
 
 
+# Data configurations under which a job's files are staged through the
+# compute site's own scratch rather than the submit host. Every hosted
+# batch catalog uses one of them; a plain HTCondor pool uses condorio,
+# where the staging site is "local".
+STAGE_ON_COMPUTE = ("nonsharedfs", "sharedfs")
+
+
+def stages_on_compute_site(profiles):
+    """Whether a site's own profiles put its scratch in the data path.
+
+    Matters because the planner can only build a cleanup URL for a file
+    it placed on the staging site itself. The FL chain files are produced
+    by deferred sub-workflows, so the parent has no PFN for them, and
+    per-file cleanup refuses to plan at all ("Unable to determine cleanup
+    url for lfn ... at site <compute>"). Under condorio the staging site
+    is the submit host and the question never arises. See README,
+    "Cleanup on a batch site".
+    """
+    dc = (profiles.get("pegasus") or {}).get("data.configuration")
+    return str(dc) in STAGE_ON_COMPUTE
+
+
+def site_stages_on_compute(site_name, sites_yml=None, base_catalog=None):
+    """Resolve stages_on_compute_site over an overlay and what it overlays.
+
+    Returns True/False, or None when neither file names a data
+    configuration — the caller should say so rather than assume.
+    """
+    for path in (sites_yml, base_catalog):
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            profiles, _ = read_site_entry(path, site_name)
+        except ValueError:
+            continue
+        if (profiles.get("pegasus") or {}).get("data.configuration"):
+            return stages_on_compute_site(profiles)
+    return None
+
+
 def split_nodelist(spec):
     """Split a Slurm node spec on commas outside [] brackets.
 

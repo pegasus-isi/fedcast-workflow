@@ -58,6 +58,7 @@ from fl_round import (
 )
 from silo_map import (
     check_silo_tags, hosted_catalog, load_silo_map, silo_tags,
+    site_stages_on_compute,
 )
 
 logging.basicConfig(
@@ -1071,6 +1072,42 @@ class FedCastWorkflow:
         self.wf.add_jobs(val_job)
 
 
+def cleanup_strategy(args, base_catalog):
+    """Whether pegasus-plan needs --cleanup leaf on this site.
+
+    The FL rounds are deferred sub-workflows, so their per-round
+    checkpoints are produced by a planner run that has not happened yet.
+    When the compute site stages data through its own scratch
+    (data.configuration nonsharedfs or sharedfs — every hosted batch
+    catalog, Unity included), the parent planner has no PFN for those
+    files and per-file cleanup will not plan at all:
+
+        Unable to determine cleanup url for lfn fed_L1_global_r001.pt
+        at site compute
+
+    --cleanup leaf plans, and still removes the site's scratch directory
+    at the end of the run. It does mean intermediate files live until
+    then; the workflow's own cleanup_file jobs still delete stale
+    checkpoints round by round, which is the part that would otherwise
+    grow without bound. Under condorio (a plain HTCondor pool) the
+    staging site is the submit host and none of this applies.
+    """
+    stages_on_compute = site_stages_on_compute(
+        args.execution_site_name, args.sites_yml, base_catalog)
+    if stages_on_compute:
+        logger.info(
+            f"Cleanup: --cleanup leaf, because site "
+            f"{args.execution_site_name!r} stages through its own scratch. "
+            f"Per-file cleanup cannot plan the FL sub-workflow checkpoints "
+            f"(see README, \"Cleanup on a batch site\")")
+    elif stages_on_compute is None:
+        logger.info(
+            "Cleanup: planner default. No site catalog here names a "
+            "data.configuration; if planning fails with \"Unable to "
+            "determine cleanup url\", add --cleanup leaf")
+    return bool(stages_on_compute)
+
+
 def check_site_catalog_setup(args, silos):
     """Report where the site catalog comes from; abort if it cannot pin.
 
@@ -1102,15 +1139,19 @@ def check_site_catalog_setup(args, silos):
             "~/.pegasusrc (hosted catalog, e.g. unity.yml) or write "
             f"{args.sites_yml} with custom_sites.py --full before planning")
 
+    # Answered before any early return below, because it applies to every
+    # run, cross-silo or not.
+    leaf_cleanup = cleanup_strategy(args, hosted_copy)
+
     if not silos:
-        return
+        return leaf_cleanup
     if args.skip_silo_tag_check:
         logger.warning(
             "--skip-silo-tag-check: not verifying that the silo tags exist. "
             "Every pinned job must find its tag on site "
             f"{args.execution_site_name!r} at plan time, or it runs "
             "unpinned and the run is not cross-silo.")
-        return
+        return leaf_cleanup
     if not local:
         raise ValueError(
             f"--silos needs the silo tags in {args.sites_yml}, which does "
@@ -1175,6 +1216,7 @@ def check_site_catalog_setup(args, silos):
             "submit that way, every pinned job runs anywhere.")
     logger.info(f"Check the pins against the pool with "
                 f"tools/silo_check.py --style <condor|slurm> {args.silos}")
+    return leaf_cleanup
 
 
 # ======================================================================
@@ -1191,8 +1233,9 @@ Examples:
   %(prog)s --start-month 2021-01 --months 48 --experiments e1 e21 e22
   %(prog)s --start-month 2021-01 --months 48 --silos silos.yml
 
-Then plan with the execution site from your site catalog (hosted catalogs
-call it "compute"):
+Then plan with the command this prints; it names the execution site from
+your site catalog (hosted catalogs call it "compute") and adds
+--cleanup leaf where the site stages through its own scratch:
   pegasus-plan --submit -s compute --output-dir output workflow.yml
 """,
     )
@@ -1405,7 +1448,7 @@ call it "compute"):
     try:
         workflow = FedCastWorkflow(args)
         workflow.log_placement()
-        check_site_catalog_setup(args, workflow.silos)
+        leaf_cleanup = check_site_catalog_setup(args, workflow.silos)
         workflow.create_pegasus_properties()
         workflow.create_transformation_catalog()
         workflow.create_replica_catalog()
@@ -1416,7 +1459,8 @@ call it "compute"):
         logger.info(f"\nWorkflow written to {args.output}")
         logger.info(f"Submit: pegasus-plan --submit "
                     f"-s {args.execution_site_name} "
-                    f"--output-dir {workflow.local_storage_dir} "
+                    + ("--cleanup leaf " if leaf_cleanup else "")
+                    + f"--output-dir {workflow.local_storage_dir} "
                     f"{args.output}")
     except ValueError as e:
         # Silo-map problems are user configuration, not bugs.

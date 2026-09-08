@@ -174,6 +174,43 @@ Nothing here is HTCondor-specific any more, but the pool this has actually
 run to completion on is a personal HTCondor pool (`--style condor --full`).
 The first Slurm run should be the pilot (`--test`).
 
+### Cleanup on a batch site
+
+The FL rounds are deferred sub-workflows: each round's checkpoints are
+produced by a planner run that has not happened when the parent is
+planned. On a site that stages data through its own scratch —
+`data.configuration: nonsharedfs` or `sharedfs`, which is every hosted
+batch catalog, Unity included — the parent planner therefore has no PFN
+for those files, and per-file cleanup refuses to plan the workflow at
+all:
+
+```
+[FATAL ERROR] Unable to determine cleanup url for lfn
+fed_L1_global_r001.pt at site compute
+```
+
+Plan such a site with `--cleanup leaf`, which the generator adds to the
+`pegasus-plan` command it prints when the catalog says the site stages on
+itself:
+
+```sh
+pegasus-plan --submit -s compute --cleanup leaf --output-dir output workflow.yml
+```
+
+Leaf cleanup still removes the site's scratch directory at the end of the
+run; what it gives up is deleting each intermediate file as soon as its
+last consumer finishes, so scratch has to hold the run's intermediate
+data (MRMS crops and per-client sequences, mainly) until the end. The
+per-round checkpoints, which are the part that would otherwise grow
+without bound, are deleted round by round by the workflow's own
+`cleanup_file` jobs either way. `--cleanup inplace` and `--cleanup
+constraint` both hit the error above; `--cleanup none` plans but leaves
+scratch behind.
+
+An HTCondor pool using `condorio` — what `custom_sites.py --style condor
+--full` writes — stages through the submit host, so its staging site is
+`local`, none of this applies, and the planner default is right.
+
 ## Data placement: emulated vs. cross-silo
 
 The paper *emulates* federation: all seven clients are carved out of one
@@ -525,7 +562,9 @@ this somewhere else:
    GPU constraint with `custom_sites.py` either way ([Sites](#sites)).
 4. Run `workflow_generator.py`, which writes `transformations.yml`,
    `pegasus.properties`, and `fl_subwf.properties` for that host, then
-   plan with `--output-dir` as it prints.
+   plan with the command it prints — it carries `--output-dir`, and
+   `--cleanup leaf` on a site that stages through its own scratch
+   ([Cleanup on a batch site](#cleanup-on-a-batch-site)).
 5. If the nodes are small, cap requests with `--max-job-memory-gb` and
    `--max-job-cores`; if jobs hit their wall-clock limit, raise
    `--runtime-scale`.
