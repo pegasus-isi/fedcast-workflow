@@ -860,14 +860,28 @@ class FedCastWorkflow:
                               register_replica=False)
             if is_validation:
                 subwf.add_inputs(File(prev_history), File(prev_best))
+                # stage_out=False even on the final round: the round
+                # itself marks its history JSON for stage-out and is
+                # planned with the parent's --output-dir, so it publishes
+                # the file. Asking the parent to publish it too makes a
+                # second stage-out job sourcing the parent's scratch,
+                # where the round leaves no copy — that pair is what
+                # failed run0001 at 94%.
                 subwf.add_outputs(File(names["history_out"]),
-                                  stage_out=is_final,
+                                  stage_out=False,
                                   register_replica=False)
                 subwf.add_outputs(File(names["best_out"]), stage_out=False,
                                   register_replica=False)
                 prev_history = names["history_out"]
                 prev_best = names["best_out"]
             if is_final:
+                # This one stays stage_out=True, and is the reason the FL
+                # chain survives planning at all: it is the only output of
+                # the last round that anything downstream requires, so
+                # with it false the planner prunes every round
+                # sub-workflow (run0002 planned with no federated arm).
+                # collect_file reads the staged copy from the output
+                # directory by path.
                 subwf.add_outputs(File(sub_best_lfn), stage_out=True,
                                   register_replica=False)
             self.wf.add_jobs(subwf)
