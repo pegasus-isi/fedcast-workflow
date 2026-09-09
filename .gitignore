@@ -5,8 +5,13 @@ __pycache__/
 
 # Pegasus artifacts
 scratch/
+wf-scratch/
 output/
 submit/
+# pegasus-plan's default submit directory is <user>/pegasus/<wf>/runNNNN
+# under the directory it runs in, so the run dirs of anyone who plans
+# from a clone land here.
+/*/pegasus/
 workflow.yml
 sites.yml
 silos.yml
