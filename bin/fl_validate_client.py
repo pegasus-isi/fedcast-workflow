@@ -46,8 +46,9 @@ def main():
                         help="Training seed; also seeds validation "
                              "sampling, identically to the central path")
     parser.add_argument("--interval-months", type=int, required=True)
-    parser.add_argument("--archive-start", required=True, help="YYYY-MM")
-    parser.add_argument("--archive-months", type=int, required=True)
+    parser.add_argument("--window-end", required=True,
+                        help="date tag YYYY-MM: last month of the "
+                             "L-month training window")
     parser.add_argument("--limit-train-sequences", type=int, default=None)
     parser.add_argument("--global-model", required=True)
     parser.add_argument("--metrics-out", required=True)
@@ -64,10 +65,8 @@ def main():
     import fedcast_common as fc
 
     client = fc.parse_client(args.client)
-    t_start = fc.interval_start_epoch(args.archive_start,
-                                      args.archive_months,
-                                      args.interval_months)
-    data = fc.load_client_data(client, t_start,
+    window = fc.window_epochs(args.window_end, args.interval_months)
+    data = fc.load_client_data(client, window,
                                limit=args.limit_train_sequences)
     val_x = data["val"][0]
     n_val = 0 if val_x is None else int(val_x.shape[0])

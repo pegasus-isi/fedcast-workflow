@@ -43,6 +43,8 @@ PAPER_COUNTS = {"KBYX": 542, "KTLX": 478, "KVNX": 489, "KLGX": 885,
 COUNT_TOLERANCE = 0.15  # +/-15% (SPEC Tier 1)
 
 SHORT_WINDOW = {1, 3, 6, 12, 24}  # R1 intervals
+# Date-tagged models per paradigm at each L (AUTHOR_FEEDBACK.md Sec. 1).
+PAPER_MODELS = {1: 2, 3: 16, 6: 8, 12: 4, 24: 2, 48: 1}
 L1_MIN_GAP = 0.05                 # SPEC Tier 2
 L48_MAX_GAP = 0.02                # SPEC Tier 2
 
@@ -140,6 +142,22 @@ def main():
             detail = (f"L={L}: fed {fed:.4f} vs cen {cen:.4f}"
                       if fed is not None else f"L={L}: missing data")
             lines.append(f"| R1 fed > cen | {detail} | {verdict} |")
+
+        # Medians above are over each L's date-tagged models; say how
+        # many there were, against the paper's n (informational: a pilot
+        # or --date-tags last run has fewer by design).
+        counts = []
+        for L in intervals:
+            n_fed, n_cen = len(e1.get(("fed", L), [])), len(
+                e1.get(("cen", L), []))
+            counts.append(f"L={L} {n_fed}/{n_cen}/"
+                          f"{PAPER_MODELS.get(L, '?')}")
+        layout = all(len(e1.get((m, L), [])) == PAPER_MODELS.get(L)
+                     for L in intervals for m in ("fed", "cen"))
+        lines.append("| Models per L (fed/cen/paper) | "
+                     + ", ".join(counts) + " | "
+                     + ("MATCH" if layout else "INFO: not the paper's "
+                        "date-tag layout") + " |")
 
         fed1, cen1 = median(e1, "fed", 1), median(e1, "cen", 1)
         if fed1 is not None and cen1 is not None:

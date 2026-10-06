@@ -29,6 +29,8 @@ def main():
         description="Initialize federated DGMR global model")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--interval-months", type=int, required=True)
+    parser.add_argument("--window-end", required=True,
+                        help="date tag YYYY-MM (recorded in the history)")
     parser.add_argument("--aggregation", required=True,
                         choices=["uniform", "quadratic"])
     parser.add_argument("--global-out", required=True)
@@ -48,7 +50,7 @@ def main():
     history = {"best_val": None, "best_unit": -1,
                "mode": "federated", "aggregation": args.aggregation,
                "seed": args.seed, "interval_months": args.interval_months,
-               "val_points": []}
+               "window_end": args.window_end, "val_points": []}
     with open(args.history_out, "w") as f:
         json.dump(history, f, indent=2)
 

@@ -136,9 +136,9 @@ So the benchmark becomes the frozen table above, with its own MRMS fetch: a
 16-frame, 256 × 256 crop centered on each event centroid. The three event-source
 fetch jobs and `build_benchmark` leave the DAG.
 
-### C — date-tagged rolling windows (structural, deferred)
+### C — date-tagged rolling windows (structural)
 
-We train one model per (method, L) on the last L months. The paper trains
+Before this item we trained one model per (method, L) on the last L months. The paper trains
 2 + 16 + 8 + 4 + 2 + 1 = 33 date-tagged models per paradigm and pools all of them
 in E1's TOPSIS. Estimated E1 cost from the author's timings: about
 5 × (108 + 131) ≈ 1,200 A100-h (each fully tiled L costs about one 48-month run;
@@ -147,15 +147,23 @@ settings cover all 33 date tags, reusing the E1 centralized models (E2.1) and
 federated models (E2.2) as references — so the new training is 33 E2.1
 federated models (~660 A100-h) and 2 × 33 centralized-SAM models (~1,100 A100-h
 before SAM's roughly 2× step cost): about 3,000–4,000 A100-h in total. The
-L = 1 tags are 2022-02 and 2022-10. Deferred until the cost is reviewed; Unity
-(MGHPCC) is where it would run.
+L = 1 tags are 2022-02 and 2022-10. Implemented in the generator (see Status);
+running it at full scale waits on the cost review. Unity (MGHPCC) is where it
+would run.
 
 ### Status
 
 - **A** and **B** implemented 2026-10-06 (with the TOPSIS candidate change and a
   CRPS normalization fix found while testing B: the spread term was K times too
   large, so CRPS went negative and rewarded noisier ensembles).
-- **C** not started.
+- **C** implemented 2026-10-06: `--date-tags rolling` (default) trains one
+  model per (method, L, date tag) on the L months ending at the tag; `last`
+  keeps the old layout. Models, checkpoints and metrics are named
+  `{method}_L{L}_{YYYYMM}`. TOPSIS keys candidates by date tag too. The
+  report's gates use the median over each L's models and list the count
+  per L against the paper's n. At full scale E1 is 66 models and
+  4,630 parent jobs plus 3,300 FL-round sub-workflows (was 12 models and
+  1,837 jobs).
 - Second reply (Sec. 5) implemented 2026-10-06: client crop jitter
   (`--crop-jitter`, default 31) and `--steps-grid {paper,mrms}`.
 
@@ -190,6 +198,12 @@ These are documented choices, revisable when the author answers.
   complete sample whose targets still overlap the event window. The shift is
   recorded per event (`init_shift_s` in `benchmark_sequences.npz`); for
   20220307_2120 it is +14 min (frames 21:26–21:56).
+- **Rolling windows (item C):** for L > 1 the n = 48 / L date tags tile the
+  archive with consecutive, non-overlapping L-month windows anchored at its
+  last month (2024-10): L = 3 tags 2021-01, 2021-04, …, 2024-10. The reply gives
+  the counts and says each window ends at its tag, which fits tiling, but does
+  not state the tags. L = 1 uses the two published tags. A sequence belongs to
+  a window by its first frame's time.
 - **Event crop (Q2):** 256 × 256 on the 0.01° grid, centered on the centroid
   — confirmed by the second reply. (Client crops are no longer our rule; see
   Sec. 5 item 2.)

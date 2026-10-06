@@ -78,7 +78,7 @@ cp "$BIN/fedcast_common.py" .
 echo "-- centralized: 2 epochs in one segment"
 # shellcheck disable=SC2086
 $PY_TRAIN "$BIN/train_dgmr.py" $CLIENTS \
-    --interval-months 1 --archive-start "$MONTH" --archive-months 1 \
+    --interval-months 1 --window-end "$MONTH" \
     --segment-index 0 --segment-size 2 --total-units 2 \
     --validate-every 1 --seed 42 \
     --limit-train-sequences 4 \
@@ -88,6 +88,7 @@ $PY_TRAIN "$BIN/train_dgmr.py" $CLIENTS \
 echo "-- federated: init + 1 FL round (the fl_* wrappers a round"
 echo "   SubWorkflow runs: train per client -> aggregate -> validate)"
 $PY_TRAIN "$BIN/fl_init.py" --seed 42 --interval-months 1 \
+    --window-end "$MONTH" \
     --aggregation uniform \
     --global-out fed_L1_global_init.pt \
     --history-out fed_L1_history_init.json \
@@ -98,7 +99,7 @@ for SITE in KTLX KENX; do
     $PY_TRAIN "$BIN/fl_train_client.py" \
         --client "${SITE}:${SITE}_sequences.npz:${SITE}_manifest.json" \
         --client-index $IDX --round 0 --seed 42 \
-        --interval-months 1 --archive-start "$MONTH" --archive-months 1 \
+        --interval-months 1 --window-end "$MONTH" \
         --limit-train-sequences 4 \
         --global-model fed_L1_global_init.pt \
         --local-model-out "fed_L1_r000_local_${SITE}.pt" \
@@ -115,7 +116,7 @@ $PY_TRAIN "$BIN/fl_aggregate.py" --round 0 --aggregation uniform \
 
 # shellcheck disable=SC2086
 $PY_TRAIN "$BIN/fl_validate.py" --round 0 $CLIENTS \
-    --interval-months 1 --archive-start "$MONTH" --archive-months 1 \
+    --interval-months 1 --window-end "$MONTH" \
     --limit-train-sequences 4 \
     --global-model fed_L1_global_r000.pt \
     --history-in fed_L1_history_init.json \
@@ -144,6 +145,7 @@ for M in cen fed; do
         --output "${M}_L1_forecasts.npz"
     # shellcheck disable=SC2086
     $PY_EVAL "$BIN/mct_verify.py" --method "$M" --interval 1 \
+        --date-tag "$MONTH" \
         --forecasts "${M}_L1_forecasts.npz" \
         --benchmark benchmark_events.csv \
         --output "${M}_L1_metrics.csv"

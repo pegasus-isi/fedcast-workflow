@@ -64,9 +64,14 @@ def _place_client_job(job, client):
                        File(client["manifest"]))
 
 
-def round_file_names(method, interval, round_num):
-    """Canonical LFNs for one round's chained artifacts."""
-    prefix = f"{method}_L{interval}"
+def round_file_names(model_id, round_num):
+    """Canonical LFNs for one round's chained artifacts.
+
+    ``model_id`` names one trained model, method + L + date tag (see
+    workflow_generator.model_id), so every date-tagged model of a method
+    gets its own chain.
+    """
+    prefix = model_id
     return {
         "global_out": f"{prefix}_global_r{round_num:03d}.pt",
         "history_out": f"{prefix}_history_r{round_num:03d}.json",
@@ -74,9 +79,9 @@ def round_file_names(method, interval, round_num):
     }
 
 
-def init_file_names(method, interval):
+def init_file_names(model_id):
     """Canonical LFNs for the fl_init artifacts (round -1)."""
-    prefix = f"{method}_L{interval}"
+    prefix = model_id
     return {
         "global_out": f"{prefix}_global_init.pt",
         "history_out": f"{prefix}_history_init.json",
@@ -85,16 +90,15 @@ def init_file_names(method, interval):
 
 
 def generate_round_workflow(
-    method,
+    model_id,
     interval,
+    window_end,         # date tag YYYY-MM: last month of the window
     round_num,
     clients,            # list of client specs; see _client_specs()
     prev_global_lfn,
     prev_history_lfn,
     prev_best_lfn,
     aggregation,        # "uniform" | "quadratic"
-    archive_start,
-    archive_months,
     seed,
     is_validation_round,
     final_best_lfn=None,        # set on the final round only
@@ -107,8 +111,8 @@ def generate_round_workflow(
     produced by this round (global model always; history/best only on
     validation rounds).
     """
-    wf = Workflow(f"{method}_L{interval}_r{round_num:03d}")
-    names = round_file_names(method, interval, round_num)
+    wf = Workflow(f"{model_id}_r{round_num:03d}")
+    names = round_file_names(model_id, round_num)
 
     common = File(COMMON_LFN)
     global_in = File(prev_global_lfn)
@@ -116,8 +120,7 @@ def generate_round_workflow(
 
     interval_args = [
         "--interval-months", str(interval),
-        "--archive-start", archive_start,
-        "--archive-months", str(archive_months),
+        "--window-end", window_end,
     ]
     pilot_args = (
         ["--limit-train-sequences", str(limit_train_sequences)]
@@ -129,9 +132,9 @@ def generate_round_workflow(
     for idx, client in enumerate(clients):
         site = client["name"]
         local_model = File(
-            f"{method}_L{interval}_r{round_num:03d}_local_{site}.pt")
+            f"{model_id}_r{round_num:03d}_local_{site}.pt")
         meta = File(
-            f"{method}_L{interval}_r{round_num:03d}_meta_{site}.json")
+            f"{model_id}_r{round_num:03d}_meta_{site}.json")
         job = (
             Job("fl_train_client",
                 _id=f"train_{site}",
@@ -220,7 +223,7 @@ def generate_round_workflow(
             # Cross-silo: score at the silo, ship metrics only.
             csite = client["name"]
             cmetrics = File(
-                f"{method}_L{interval}_r{round_num:03d}_val_{csite}.json")
+                f"{model_id}_r{round_num:03d}_val_{csite}.json")
             cjob = (
                 Job("fl_validate_client",
                     _id=f"valclient_{csite}",

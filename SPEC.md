@@ -154,8 +154,10 @@ image the jobs run is the one on the submit host.
    volumetric data.
 2. Exactly the seven radar-centered 3°×3° subdomains at the WSR-88D coordinates of
    KBYX, KTLX, KVNX, KLGX, KENX, KBOX, PAHG → 300×300 fields.
-3. 48-month contiguous archive; training intervals selected as suffixes/subsets of it
-   with matched periods across paradigms.
+3. 48-month contiguous archive. Each trained model has a date tag and trains on the
+   L calendar months ending with it; centralized and federated models share date
+   tags, so their periods match. n = (2, 16, 8, 4, 2, 1) models per paradigm for
+   L = (1, 3, 6, 12, 24, 48) (AUTHOR_FEEDBACK.md item C).
 4. Sequence definition: 16 frames at 2-min cadence — 4 input (8-min context), 12
    target (24-min horizon).
 5. Split rule: test = first three available days of each month (contiguous held-out

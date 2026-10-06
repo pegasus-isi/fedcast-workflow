@@ -71,8 +71,9 @@ def main():
     parser.add_argument("--client", action="append", required=True,
                         help="SITE:sequences_lfn:manifest_lfn (repeatable)")
     parser.add_argument("--interval-months", type=int, required=True)
-    parser.add_argument("--archive-start", required=True, help="YYYY-MM")
-    parser.add_argument("--archive-months", type=int, required=True)
+    parser.add_argument("--window-end", required=True,
+                        help="date tag YYYY-MM: last month of the "
+                             "L-month training window")
     parser.add_argument("--segment-index", type=int, required=True)
     parser.add_argument("--segment-size", type=int, required=True)
     parser.add_argument("--total-units", type=int, required=True)
@@ -104,16 +105,14 @@ def main():
                        args.limit_train_sequences)
 
     clients = [fc.parse_client(c) for c in args.client]
-    t_start = fc.interval_start_epoch(args.archive_start,
-                                      args.archive_months,
-                                      args.interval_months)
-    data = [fc.load_client_data(c, t_start,
+    window = fc.window_epochs(args.window_end, args.interval_months)
+    data = [fc.load_client_data(c, window,
                                 limit=args.limit_train_sequences)
             for c in clients]
     data = [d for d in data if d["n_train"] > 0]
     if not data:
-        logger.error("No training data in interval L=%d",
-                     args.interval_months)
+        logger.error("No training data in the L=%d window ending %s",
+                     args.interval_months, args.window_end)
         save_state(args.state_out, {}, {}, {"error": "no data"})
         sys.exit(1)
 
@@ -129,6 +128,7 @@ def main():
         history = {"unit": 0, "best_val": None, "best_unit": -1,
                    "mode": "centralized", "seed": args.seed,
                    "interval_months": args.interval_months,
+                   "window_end": args.window_end,
                    "val_points": []}
 
     start_unit = history["unit"]

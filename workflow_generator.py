@@ -11,9 +11,10 @@ Pipeline phases (SPEC.md Sec. 1.1):
   A. Data       — fetch+crop MRMS per (site, month), build sequences per site
   B. Benchmark  — fetch a 16-frame MRMS sample for each of the paper's 12
                   frozen benchmark events (benchmark_events.csv)
-  C. Training   — per interval L: centralized DGMR and federated DGMR (Flower),
-                  as chains of checkpointed segment jobs (SPEC open question 6b)
-  D. Evaluation — MCT-style inference + verification per (method, L), TOPSIS
+  C. Training   — per interval L and date tag: centralized DGMR and federated
+                  DGMR (Flower) on the L months ending at the tag, as chains
+                  of checkpointed segment jobs (SPEC open question 6b)
+  D. Evaluation — MCT-style inference + verification per trained model, TOPSIS
   E. Ablations  — E2.1 quadratic client weighting, E2.2 SAM centralized
 
 Sites. The workflow does not describe any scheduler. Every transformation
@@ -169,6 +170,41 @@ def month_range(start_month, n_months):
     return months
 
 
+# The paper's L = 1 date tags (AUTHOR_FEEDBACK.md Sec. 5, Q3): the only
+# L whose two windows do not tile the archive.
+PAPER_L1_TAGS = ["2022-02", "2022-10"]
+
+
+def date_tags_for(months, interval, mode, l1_tags):
+    """Date tags (window-end months) of every model trained at L months.
+
+    ``rolling`` is the paper's layout: n = (2, 16, 8, 4, 2, 1) models for
+    L = (1, 3, 6, 12, 24, 48) over 48 months (AUTHOR_FEEDBACK.md Sec. 1).
+    For L > 1 that is the archive tiled by consecutive, non-overlapping
+    L-month windows, anchored at its last month (n = 48 / L in every
+    case; our reading, see AUTHOR_FEEDBACK.md Sec. 4). L = 1 uses the
+    two published tags instead of all 48 months. ``last`` trains one
+    model per L on the archive's final L months (the pre-item-C layout).
+    """
+    if mode == "last":
+        return [months[-1]]
+    if interval == 1:
+        missing = [t for t in l1_tags if t not in months]
+        if missing:
+            raise ValueError(
+                f"L=1 date tags {missing} are outside the archive "
+                f"{months[0]}..{months[-1]}; pass --l1-tags or "
+                f"--date-tags last")
+        return sorted(l1_tags)
+    return sorted(months[i] for i in range(len(months) - 1,
+                                           interval - 2, -interval))
+
+
+def model_id(method, interval, window_end):
+    """Name of one trained model: method, L and date tag."""
+    return f"{method}_L{interval}_{window_end.replace('-', '')}"
+
+
 class FedCastWorkflow:
     """Fed-Cast reproduction workflow (see SPEC.md)."""
 
@@ -199,6 +235,11 @@ class FedCastWorkflow:
                       if args.silos else None)
         self.months = month_range(args.start_month, args.months)
         self.intervals = sorted(args.intervals)
+        # Date tags per L: one trained model per (method, L, tag).
+        self.date_tags = {
+            L: date_tags_for(self.months, L, args.date_tags, args.l1_tags)
+            for L in self.intervals
+        }
         self.experiments = args.experiments
 
         # Per-site sequence/manifest files shared across phases.
@@ -207,11 +248,11 @@ class FedCastWorkflow:
         # mode (where shards are not declared files, so Pegasus cannot
         # infer the dependency).
         self.prep_jobs = {}
-        # Per-method best checkpoints: {(method, L): File}
+        # Best checkpoints: {(method, L, date_tag): File}
         self.best_ckpts = {}
         # Benchmark file shared between Phase B and D.
         self.benchmark_file = None
-        # Metric CSVs collected for TOPSIS pools: {method: {L: File}}
+        # Metric CSVs for TOPSIS pools: {method: {(L, date_tag): File}}
         self.metric_files = {}
         # FL-round sub-workflow YAMLs live here (generated files).
         self.rounds_dir = os.path.abspath("fl_rounds")
@@ -695,7 +736,8 @@ class FedCastWorkflow:
             specs.append(spec)
         return specs
 
-    def _add_centralized_chain(self, method, interval, extra_args=None):
+    def _add_centralized_chain(self, method, interval, window_end,
+                               extra_args=None):
         """Chain of checkpointed centralized training segment jobs.
 
         Each segment runs `--segment-size` epochs, carrying a state
@@ -714,18 +756,18 @@ class FedCastWorkflow:
             seq_inputs.append(self.site_files[site]["manifest"])
 
         prev_state = None
-        best_ckpt = File(f"{method}_L{interval}_best.ckpt")
+        mid = model_id(method, interval, window_end)
+        best_ckpt = File(f"{mid}_best.ckpt")
         for k in range(n_segments):
-            state_out = File(f"{method}_L{interval}_seg{k}_state.tar.gz")
+            state_out = File(f"{mid}_seg{k}_state.tar.gz")
             is_last = k == n_segments - 1
             job = (
                 Job("train_dgmr",
-                    _id=f"train_{method}_L{interval}_seg{k}",
-                    node_label=f"train_{method}_L{interval}_seg{k}")
+                    _id=f"train_{mid}_seg{k}",
+                    node_label=f"train_{mid}_seg{k}")
                 .add_args(
                     "--interval-months", str(interval),
-                    "--archive-start", self.months[0],
-                    "--archive-months", str(len(self.months)),
+                    "--window-end", window_end,
                     "--segment-index", str(k),
                     "--segment-size", str(seg_size),
                     "--total-units", str(total),
@@ -736,7 +778,7 @@ class FedCastWorkflow:
                 .add_inputs(*seq_inputs)
                 .add_outputs(state_out, stage_out=False,
                              register_replica=False)
-                .add_pegasus_profiles(label=f"{method}_L{interval}",
+                .add_pegasus_profiles(label=mid,
                                       tag=gpu_tag_for("train_dgmr"))
             )
             for site in self.sites:
@@ -760,31 +802,34 @@ class FedCastWorkflow:
             self.wf.add_jobs(job)
             prev_state = state_out
 
-        self.best_ckpts[(method, interval)] = best_ckpt
+        self.best_ckpts[(method, interval, window_end)] = best_ckpt
 
-    def _add_federated_subworkflows(self, method, interval, aggregation):
+    def _add_federated_subworkflows(self, method, interval, window_end,
+                                    aggregation):
         """Federated training: one SubWorkflow per FL round.
 
         fl_init seeds the global model; each round's sub-DAG fans out one
         local epoch per client, aggregates (FedAvg), and — on validation
         rounds — chains the history and best-so-far checkpoint. The final
-        round emits {method}_L{interval}_best.ckpt.
+        round emits {model_id}_best.ckpt.
         """
         rounds = self.args.rounds
         clients = self._client_specs()
         common = File(COMMON_LFN)
 
-        init_names = init_file_names(method, interval)
+        mid = model_id(method, interval, window_end)
+        init_names = init_file_names(mid)
         init_global = File(init_names["global_out"])
         init_history = File(init_names["history_out"])
         init_best = File(init_names["best_out"])
         init_job = (
             Job("fl_init",
-                _id=f"flinit_{method}_L{interval}",
-                node_label=f"flinit_{method}_L{interval}")
+                _id=f"flinit_{mid}",
+                node_label=f"flinit_{mid}")
             .add_args(
                 "--seed", str(self.args.train_seed),
                 "--interval-months", str(interval),
+                "--window-end", window_end,
                 "--aggregation", aggregation,
                 "--global-out", init_global,
                 "--history-out", init_history,
@@ -797,7 +842,7 @@ class FedCastWorkflow:
                          register_replica=False)
             .add_outputs(init_best, stage_out=False,
                          register_replica=False)
-            .add_pegasus_profiles(label=f"{method}_L{interval}")
+            .add_pegasus_profiles(label=mid)
         )
         self.wf.add_jobs(init_job)
 
@@ -808,7 +853,7 @@ class FedCastWorkflow:
         # site under a "_sub" name; a collect_file bridge job then brings
         # it into parent staging under the canonical LFN (parent stage-ins
         # cannot see sub-workflow output locations directly).
-        sub_best_lfn = f"{method}_L{interval}_best_sub.ckpt"
+        sub_best_lfn = f"{mid}_best_sub.ckpt"
         last_subwf = None
 
         # Chained artifacts accumulate on the output site (the next
@@ -824,8 +869,8 @@ class FedCastWorkflow:
             if not targets:
                 return
             job = Job("cleanup_file",
-                      _id=f"clean_{method}_L{interval}_{tag}",
-                      node_label=f"clean_{method}_L{interval}_{tag}")
+                      _id=f"clean_{mid}_{tag}",
+                      node_label=f"clean_{mid}_{tag}")
             job.add_args("-f", *[
                 os.path.join(self.local_storage_dir, t) for t in targets
             ])
@@ -842,23 +887,22 @@ class FedCastWorkflow:
                              or is_final)
 
             round_wf, names = generate_round_workflow(
-                method=method,
+                model_id=mid,
                 interval=interval,
+                window_end=window_end,
                 round_num=r,
                 clients=clients,
                 prev_global_lfn=prev_global,
                 prev_history_lfn=prev_history,
                 prev_best_lfn=prev_best,
                 aggregation=aggregation,
-                archive_start=self.months[0],
-                archive_months=len(self.months),
                 seed=self.args.train_seed,
                 is_validation_round=is_validation,
                 final_best_lfn=sub_best_lfn if is_final else None,
                 limit_train_sequences=limit,
                 gpu_tag=GPU_TAG,
             )
-            yml_lfn = f"{method}_L{interval}_r{r:03d}.yml"
+            yml_lfn = f"{mid}_r{r:03d}.yml"
             yml_path = os.path.join(self.rounds_dir, yml_lfn)
             round_wf.write(yml_path)
             self.rc.add_replica("local", yml_lfn,
@@ -866,8 +910,8 @@ class FedCastWorkflow:
 
             subwf = SubWorkflow(
                 yml_lfn, is_planned=False,
-                _id=f"round_{method}_L{interval}_r{r:03d}",
-                node_label=f"round_{method}_L{interval}_r{r:03d}",
+                _id=f"round_{mid}_r{r:03d}",
+                node_label=f"round_{mid}_r{r:03d}",
             )
             # Same output directory as the parent (see __init__), so the
             # collect_file bridge below finds the final checkpoint.
@@ -928,11 +972,11 @@ class FedCastWorkflow:
                     stale.extend([hist, best])
                 add_cleanup(f"r{r:03d}", stale, subwf)
 
-        best_ckpt = File(f"{method}_L{interval}_best.ckpt")
+        best_ckpt = File(f"{mid}_best.ckpt")
         collect_job = (
             Job("collect_file",
-                _id=f"collect_{method}_L{interval}",
-                node_label=f"collect_{method}_L{interval}")
+                _id=f"collect_{mid}",
+                node_label=f"collect_{mid}")
             .add_args(os.path.join(self.local_storage_dir, sub_best_lfn),
                       best_ckpt)
             .add_outputs(best_ckpt, stage_out=True, register_replica=False)
@@ -953,29 +997,36 @@ class FedCastWorkflow:
             final_stale.append(hist)
         add_cleanup("final", final_stale, collect_job)
 
-        self.best_ckpts[(method, interval)] = best_ckpt
+        self.best_ckpts[(method, interval, window_end)] = best_ckpt
 
     def _add_phase_c_training(self):
         for interval in self.intervals:
-            if "e1" in self.experiments:
-                self._add_centralized_chain("cen", interval)
-                self._add_federated_subworkflows("fed", interval,
-                                                 "uniform")
-            if "e21" in self.experiments:
-                self._add_federated_subworkflows("fedq", interval,
-                                                 "quadratic")
-            if "e22" in self.experiments:
-                for rho in self.args.sam_rho:
-                    method = f"censam{str(rho).replace('0.', '')}"
-                    self._add_centralized_chain(
-                        method, interval,
-                        extra_args=[("--sam-rho", str(rho))],
-                    )
+            for window_end in self.date_tags[interval]:
+                self._add_models_for_window(interval, window_end)
+
+    def _add_models_for_window(self, interval, window_end):
+        """Every experiment's models for one (L, date tag) window."""
+        if "e1" in self.experiments:
+            self._add_centralized_chain("cen", interval, window_end)
+            self._add_federated_subworkflows("fed", interval, window_end,
+                                             "uniform")
+        if "e21" in self.experiments:
+            self._add_federated_subworkflows("fedq", interval, window_end,
+                                             "quadratic")
+        if "e22" in self.experiments:
+            for rho in self.args.sam_rho:
+                method = f"censam{str(rho).replace('0.', '')}"
+                self._add_centralized_chain(
+                    method, interval, window_end,
+                    extra_args=[("--sam-rho", str(rho))],
+                )
 
     # -- Phase D: evaluation ----------------------------------------------
-    def _add_eval_pair(self, method, interval, ckpt=None):
-        """Add mct_infer + mct_verify for one (method, interval)."""
-        tag = f"{method}_L{interval}" if interval else method
+    def _add_eval_pair(self, method, interval=None, window_end=None,
+                       ckpt=None):
+        """Add mct_infer + mct_verify for one model (or STEPS)."""
+        tag = (model_id(method, interval, window_end) if interval
+               else method)
         forecasts = File(f"{tag}_forecasts.npz")
 
         infer_job = (
@@ -1012,18 +1063,20 @@ class FedCastWorkflow:
             .add_pegasus_profiles(label=tag)
         )
         if interval:
-            verify_job.add_args("--interval", str(interval))
+            verify_job.add_args("--interval", str(interval),
+                                "--date-tag", window_end)
         self.wf.add_jobs(verify_job)
 
-        self.metric_files.setdefault(method, {})[interval] = metrics
+        self.metric_files.setdefault(method, {})[
+            (interval, window_end)] = metrics
         return metrics
 
     def _add_phase_d_evaluation(self):
         # STEPS is training-free: a single evaluation reused by all pools.
-        steps_metrics = self._add_eval_pair("steps", None)
+        steps_metrics = self._add_eval_pair("steps")
 
-        for (method, interval), ckpt in self.best_ckpts.items():
-            self._add_eval_pair(method, interval, ckpt=ckpt)
+        for (method, interval, window_end), ckpt in self.best_ckpts.items():
+            self._add_eval_pair(method, interval, window_end, ckpt=ckpt)
 
         # TOPSIS pools — separately normalized per experiment (SPEC
         # constraint 14). E1: cen+fed+steps; E2.1: fedq+cen+steps;
@@ -1054,7 +1107,7 @@ class FedCastWorkflow:
             )
             topsis_job.add_args("--metrics", steps_metrics)
             for method in methods:
-                for interval, mfile in self.metric_files[method].items():
+                for mfile in self.metric_files[method].values():
                     topsis_job.add_args("--metrics", mfile)
                     pool_inputs.append(mfile)
             topsis_job.add_inputs(*pool_inputs)
@@ -1331,6 +1384,19 @@ your site catalog (hosted catalogs call it "compute") and adds
                         default=[1, 3, 6, 12, 24, 48],
                         help="Training intervals L in months "
                              "(default: 1 3 6 12 24 48)")
+    parser.add_argument("--date-tags", choices=["rolling", "last"],
+                        default="rolling",
+                        help="Which windows each L trains on. rolling "
+                             "(default, the paper): one model per date "
+                             "tag, the archive tiled by L-month windows "
+                             "ending at its last month, and --l1-tags for "
+                             "L=1 — 33 models per method over 48 months. "
+                             "last: one model per L on the final L months")
+    parser.add_argument("--l1-tags", type=str, nargs="+",
+                        default=PAPER_L1_TAGS, metavar="YYYY-MM",
+                        help="Date tags of the L=1 models in rolling mode "
+                             "(default: the paper's "
+                             + " ".join(PAPER_L1_TAGS) + ")")
     parser.add_argument("--rounds", type=int, default=100,
                         help="FL rounds / centralized epochs (default: 100)")
     parser.add_argument("--segment-size", type=int, default=10,
@@ -1464,6 +1530,8 @@ your site catalog (hosted catalogs call it "compute") and adds
         args.start_month = "2024-01"
         args.months = 1
         args.intervals = [1]
+        # The paper's L=1 tags are outside the one-month pilot archive.
+        args.l1_tags = [args.start_month]
         args.rounds = 2
         args.segment_size = 1
         args.validate_every = 1
@@ -1484,6 +1552,13 @@ your site catalog (hosted catalogs call it "compute") and adds
         print(f"Error: largest interval ({max(args.intervals)}) exceeds "
               f"archive length ({args.months} months)")
         sys.exit(1)
+    if args.date_tags == "rolling" and 1 in args.intervals:
+        try:
+            date_tags_for(month_range(args.start_month, args.months), 1,
+                          args.date_tags, args.l1_tags)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
     if "e22" in args.experiments and not args.sam_rho:
         print("Error: --experiments e22 requires at least one --sam-rho")
         sys.exit(1)
@@ -1494,6 +1569,16 @@ your site catalog (hosted catalogs call it "compute") and adds
     logger.info(f"Sites: {args.sites}")
     logger.info(f"Archive: {args.start_month} + {args.months} months")
     logger.info(f"Intervals: {args.intervals}")
+    for L in sorted(args.intervals):
+        tags = date_tags_for(month_range(args.start_month, args.months), L,
+                             args.date_tags, args.l1_tags)
+        logger.info(f"  L={L}: {len(tags)} date tag(s) "
+                    f"{tags[0]}..{tags[-1]}")
+        unused = args.months % L
+        if args.date_tags == "rolling" and L > 1 and unused:
+            logger.warning(f"  L={L} does not divide {args.months} "
+                           f"months: the first {unused} month(s) are in "
+                           f"no L={L} window")
     logger.info(f"Experiments: {args.experiments}")
     logger.info(f"Training budget: {args.rounds} rounds/epochs in segments "
                 f"of {args.segment_size}")

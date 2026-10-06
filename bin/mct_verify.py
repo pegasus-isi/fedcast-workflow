@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""MCT verification: compute the Table-I metric suite for one (method, L).
+"""MCT verification: compute the Table-I metric suite for one model.
 
 Metrics are computed PER LEAD TIME and then averaged across the 12 lead
 times (SPEC.md constraint 13), per forecast instance. Deterministic scores
@@ -8,10 +8,10 @@ use the ensemble mean; CRPS uses the full ensemble (constraint 12).
 Rain/no-rain threshold: --rain-threshold (0.1 mm/h).
 
 Output CSV columns:
-  method, interval, event_id, site, start_epoch, metric, value
+  method, interval, date_tag, event_id, site, start_epoch, metric, value
 
-The interval L is parsed from the forecasts filename tag by the caller and
-passed via --interval ("" for STEPS).
+The caller passes the model's interval L and date tag (the last month of
+its training window) via --interval and --date-tag; both are "" for STEPS.
 """
 
 import argparse
@@ -108,11 +108,12 @@ def rapsd_distance(fcst, obs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute the MCT metric suite for one (method, L)")
+        description="Compute the MCT metric suite for one model")
     parser.add_argument("--method", required=True)
     # nargs="?" tolerates a bare `--interval` flag: Pegasus drops
     # empty-string arguments when serializing job args.
     parser.add_argument("--interval", nargs="?", const="", default="")
+    parser.add_argument("--date-tag", nargs="?", const="", default="")
     parser.add_argument("--forecasts", required=True)
     parser.add_argument("--rain-threshold", type=float, default=0.1)
     parser.add_argument("--output", required=True)
@@ -123,8 +124,8 @@ def main():
             logger.error("Empty forecasts file %s", args.forecasts)
             with open(args.output, "w", newline="") as f:
                 csv.writer(f).writerow(
-                    ["method", "interval", "event_id", "site",
-                     "start_epoch", "metric", "value"])
+                    ["method", "interval", "date_tag", "event_id",
+                     "site", "start_epoch", "metric", "value"])
             sys.exit(1)
         forecasts = data["forecasts"].astype(np.float32)   # (N,K,12,H,W)
         observations = data["observations"].astype(np.float32)
@@ -160,18 +161,18 @@ def main():
         summary["Executing_Time"] = float(exec_times[i])
 
         for metric, value in summary.items():
-            rows.append([args.method, args.interval,
+            rows.append([args.method, args.interval, args.date_tag,
                          str(event_ids[i]), str(sites[i]),
                          float(start_epochs[i]), metric, value])
 
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["method", "interval", "event_id", "site",
-                         "start_epoch", "metric", "value"])
+        writer.writerow(["method", "interval", "date_tag", "event_id",
+                         "site", "start_epoch", "metric", "value"])
         writer.writerows(rows)
 
-    logger.info("%s L=%s: %d instances x %d metrics -> %s",
-                args.method, args.interval or "-", n_inst,
+    logger.info("%s L=%s %s: %d instances x %d metrics -> %s",
+                args.method, args.interval or "-", args.date_tag, n_inst,
                 len(rows) // max(n_inst, 1), args.output)
 
 

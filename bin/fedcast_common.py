@@ -122,16 +122,31 @@ def decode_sequences(raw):
                          neginf=0.0)
 
 
-def interval_start_epoch(archive_start, archive_months, interval_months):
-    """Epoch seconds of the first month inside the LAST L months.
+def month_index(yyyy_mm):
+    """YYYY-MM -> months since year 0 (for month arithmetic)."""
+    year, mon = (int(x) for x in yyyy_mm.split("-"))
+    return year * 12 + (mon - 1)
 
-    The training interval L uses the last L months of the archive
-    (SPEC.md open question 11 — our documented rule).
-    """
-    year, mon = (int(x) for x in archive_start.split("-"))
-    total = year * 12 + (mon - 1) + archive_months - interval_months
-    y, m = divmod(total, 12)
+
+def month_start_epoch(index):
+    """Epoch seconds of the first instant of month ``index``."""
+    y, m = divmod(index, 12)
     return datetime(y, m + 1, 1, tzinfo=timezone.utc).timestamp()
+
+
+def window_epochs(window_end, interval_months):
+    """[start, end) epoch seconds of the training window for one model.
+
+    The window is the L calendar months ending with the date tag
+    ``window_end`` (YYYY-MM), inclusive (AUTHOR_FEEDBACK.md Sec. 1:
+    "each window ends at its date tag and spans the preceding L calendar
+    months"). A sequence belongs to the window by its first frame's time,
+    so one starting in the last half hour of the window may run up to 30
+    minutes past its end.
+    """
+    end = month_index(window_end) + 1
+    return (month_start_epoch(end - interval_months),
+            month_start_epoch(end))
 
 
 def escape_export_segment(key):
@@ -354,10 +369,11 @@ def require_shard(client):
     raise FileNotFoundError(path)
 
 
-def load_client_data(client, t_start, limit=None):
+def load_client_data(client, window, limit=None):
     """Return dict with train/val tensors for one client.
 
-    Filters to sequences starting at/after ``t_start``. ``limit`` caps
+    Keeps sequences whose first frame falls in ``window``, a
+    ``(t_start, t_end)`` pair from window_epochs(). ``limit`` caps
     train/val sequences per client (pilot/CPU smoke tests only).
     """
     import torch
@@ -367,7 +383,8 @@ def load_client_data(client, t_start, limit=None):
         seqs = data["sequences"]
         starts = data["start_epoch"]
         split = data["split"]
-    keep = starts >= t_start
+    t_start, t_end = window
+    keep = (starts >= t_start) & (starts < t_end)
     seqs, split = seqs[keep], split[keep]
 
     def to_tensor(mask):

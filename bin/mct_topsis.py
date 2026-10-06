@@ -2,8 +2,8 @@
 
 """Objective-side-balanced TOPSIS over one candidate pool (paper Eq. 5-6).
 
-Candidates: one per trained model, keyed (method, interval) — the paper's
-"date-tagged instances" are models, not events (AUTHOR_FEEDBACK.md). Each
+Candidates: one per trained model, keyed (method, interval, date_tag) — the
+paper's "date-tagged instances" are models, not events (AUTHOR_FEEDBACK.md). Each
 candidate's criterion is its per-event score (already lead-averaged by
 mct_verify) averaged over the benchmark events. Normalization and ideals are
 fitted over THIS pool only (SPEC.md constraint 14): scores are never
@@ -18,7 +18,7 @@ Weighting: each objective side gets total weight 0.5, split equally among
 its active criteria. Vector normalization. No clipping, no epsilon
 stabilization (legacy-faithful; SPEC constraint 14).
 
-Output CSV: pool, method, interval, n_events, topsis.
+Output CSV: pool, method, interval, date_tag, n_events, topsis.
 """
 
 import argparse
@@ -55,7 +55,7 @@ def main():
     with np.load(args.benchmark, allow_pickle=False) as data:
         expected = frozenset(str(e) for e in data["event_id"])
 
-    # per_event[(method, interval)][metric][event_id] = value
+    # per_event[(method, interval, date_tag)][metric][event_id] = value
     per_event = defaultdict(lambda: defaultdict(dict))
     for path in args.metrics:
         with open(path, newline="") as f:
@@ -64,7 +64,8 @@ def main():
                     value = float(row["value"])
                 except ValueError:
                     continue
-                per_event[(row["method"], row["interval"])][
+                per_event[(row["method"], row["interval"],
+                           row["date_tag"])][
                     row["metric"]][row["event_id"]] = value
 
     # Average each metric over events. A candidate missing an event would
@@ -73,7 +74,7 @@ def main():
     # candidate's event set must be the benchmark's, exactly.
     event_sets = {k: frozenset().union(*(set(v) for v in m.values()))
                   for k, m in per_event.items()}
-    wrong = {f"{k[0]} L={k[1] or '-'}": sorted(expected ^ v)
+    wrong = {f"{k[0]} L={k[1] or '-'} {k[2]}": sorted(expected ^ v)
              for k, v in sorted(event_sets.items()) if v != expected}
     if wrong:
         logger.error("Pool %s: candidates not scored on exactly the %d "
@@ -81,7 +82,7 @@ def main():
                      args.pool, len(expected), wrong)
         with open(args.output, "w", newline="") as f:
             csv.writer(f).writerow(["pool", "method", "interval",
-                                    "n_events", "topsis"])
+                                    "date_tag", "n_events", "topsis"])
         sys.exit(1)
     candidates = {
         k: {metric: float(np.mean(list(vals.values())))
@@ -94,7 +95,7 @@ def main():
         logger.error("No candidates in pool %s", args.pool)
         with open(args.output, "w", newline="") as f:
             csv.writer(f).writerow(["pool", "method", "interval",
-                                    "n_events", "topsis"])
+                                    "date_tag", "n_events", "topsis"])
         sys.exit(1)
 
     keys = sorted(candidates)
@@ -142,14 +143,16 @@ def main():
 
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["pool", "method", "interval", "n_events", "topsis"])
+        writer.writerow(["pool", "method", "interval", "date_tag",
+                         "n_events", "topsis"])
         for k, score in zip(keys, closeness):
             writer.writerow([args.pool, *k, n_events[k], float(score)])
 
-    for (method, interval), score in zip(keys, closeness):
-        logger.info("%s: %s L=%s TOPSIS %.4f (%d events)", args.pool,
-                    method, interval or "-", float(score),
-                    n_events[(method, interval)])
+    for k, score in zip(keys, closeness):
+        method, interval, date_tag = k
+        logger.info("%s: %s L=%s %s TOPSIS %.4f (%d events)", args.pool,
+                    method, interval or "-", date_tag, float(score),
+                    n_events[k])
 
 
 if __name__ == "__main__":

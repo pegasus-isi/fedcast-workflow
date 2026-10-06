@@ -93,6 +93,8 @@ Or run the wrappers directly without Pegasus/HTCondor:
 | `--months` | 48 | Archive length |
 | `--sites` | all 7 | Radar sites / federated clients |
 | `--intervals` | 1 3 6 12 24 48 | Training intervals L (months) |
+| `--date-tags` | rolling | `rolling`: one model per date tag, as in the paper (33 per method over 48 months); `last`: one model per L on the final L months |
+| `--l1-tags` | 2022-02 2022-10 | Date tags of the L=1 models (`rolling` only) |
 | `--rounds` | 100 | FL rounds / centralized epochs |
 | `--segment-size` | 10 | Rounds/epochs per training segment job |
 | `--experiments` | e1 | Pools: `e1`, `e21` (quadratic), `e22_*` (one per SAM ρ) |
@@ -552,8 +554,10 @@ a long run.
   In cross-silo runs each also records where the shard landed and which
   host, job user and `HOME` resolved that path.
 - `benchmark_sequences.npz` — the 12 benchmark event samples, as evaluated
-- `{method}_L{L}_best.ckpt` — best-validation-loss checkpoints
-- `{method}_L{L}_metrics.csv`, `steps_metrics.csv` — per-event metrics
+- `{method}_L{L}_{YYYYMM}_best.ckpt` — best-validation-loss checkpoints,
+  one per date tag (the last month of the model's training window)
+- `{method}_L{L}_{YYYYMM}_metrics.csv`, `steps_metrics.csv` — per-event
+  metrics
 - `e1_topsis.csv` (+ `e21`/`e22_*`) — per-pool TOPSIS scores, one row per
   trained model (metrics averaged over the benchmark events)
 - `figures.tar.gz` — learning-curve plots + summary table
@@ -609,9 +613,10 @@ configuration file, not the parent's. Re-run the generator after changing
   (AUTHOR_FEEDBACK.md). Where each event's forecast starts inside its
   window, and its exact footprint, are still our rules (SPEC open
   question 10).
-- E1 trains one model per (method, L) on the last L months; the paper
-  trains 33 date-tagged rolling-window models per method
-  (AUTHOR_FEEDBACK.md, item C). Not yet implemented.
+- The rolling date-tag layout (`--date-tags rolling`, AUTHOR_FEEDBACK.md
+  item C) tiles the archive with L-month windows that end at its last
+  month. The count per L is the paper's, but the author has not confirmed
+  that the windows tile the archive this way (AUTHOR_FEEDBACK.md Sec. 4).
 - Container package versions are unpinned until the paper's exact releases
   are known (SPEC open question 9).
 - Cross-silo mode makes the *shards* resident, not the ingest: MRMS is

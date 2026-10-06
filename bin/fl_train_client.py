@@ -40,8 +40,9 @@ def main():
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--interval-months", type=int, required=True)
-    parser.add_argument("--archive-start", required=True, help="YYYY-MM")
-    parser.add_argument("--archive-months", type=int, required=True)
+    parser.add_argument("--window-end", required=True,
+                        help="date tag YYYY-MM: last month of the "
+                             "L-month training window")
     parser.add_argument("--limit-train-sequences", type=int, default=None)
     parser.add_argument("--global-model", required=True)
     parser.add_argument("--local-model-out", required=True)
@@ -59,10 +60,8 @@ def main():
     import fedcast_common as fc
 
     client = fc.parse_client(args.client)
-    t_start = fc.interval_start_epoch(args.archive_start,
-                                      args.archive_months,
-                                      args.interval_months)
-    data = fc.load_client_data(client, t_start,
+    window = fc.window_epochs(args.window_end, args.interval_months)
+    data = fc.load_client_data(client, window,
                                limit=args.limit_train_sequences)
 
     meta = {"site": client["name"], "round": args.round,

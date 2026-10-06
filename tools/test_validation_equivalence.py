@@ -45,7 +45,7 @@ import fedcast_common as fc                                  # noqa: E402
 
 SITES = ["KTLX", "KENX", "KBYX"]
 SEED = 42
-START_MONTH, ARCHIVE_MONTHS, INTERVAL = "2024-01", 1, 1
+START_MONTH, INTERVAL = "2024-01", 1
 
 
 class StubDGMR(torch.nn.Module):
@@ -68,9 +68,10 @@ def write_shard(directory, site, n_sequences):
     seqs = rng.random(
         (n_sequences, fc.INPUT_FRAMES + fc.FORECAST_STEPS, size, size)
     ).astype(np.float16)
-    # Everything inside the interval, alternating train/val so both splits
-    # are populated.
-    start = np.full(n_sequences, 1.9e9)
+    # Everything inside the training window (a day after it opens),
+    # alternating train/val so both splits are populated.
+    start = np.full(n_sequences,
+                    fc.window_epochs(START_MONTH, INTERVAL)[0] + 86400)
     split = np.array([i % 2 for i in range(n_sequences)], dtype=np.int8)
 
     seq_path = directory / f"{site}_sequences.npz"
@@ -97,8 +98,7 @@ def main():
 
         interval_args = [
             "--interval-months", str(INTERVAL),
-            "--archive-start", START_MONTH,
-            "--archive-months", str(ARCHIVE_MONTHS),
+            "--window-end", START_MONTH,
         ]
 
         # ---- path 1: each client scores at its silo -------------------

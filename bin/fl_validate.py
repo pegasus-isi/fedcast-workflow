@@ -50,8 +50,9 @@ def main():
                              "fl_validate_client.py (repeatable; "
                              "cross-silo mode)")
     parser.add_argument("--interval-months", type=int, required=True)
-    parser.add_argument("--archive-start", required=True, help="YYYY-MM")
-    parser.add_argument("--archive-months", type=int, required=True)
+    parser.add_argument("--window-end", required=True,
+                        help="date tag YYYY-MM: last month of the "
+                             "L-month training window")
     parser.add_argument("--limit-train-sequences", type=int, default=None)
     parser.add_argument("--global-model", required=True)
     parser.add_argument("--history-in", required=True)
@@ -94,10 +95,8 @@ def main():
                     len(per_client))
     else:
         clients = [fc.parse_client(c) for c in args.client]
-        t_start = fc.interval_start_epoch(args.archive_start,
-                                          args.archive_months,
-                                          args.interval_months)
-        data = [fc.load_client_data(c, t_start,
+        window = fc.window_epochs(args.window_end, args.interval_months)
+        data = [fc.load_client_data(c, window,
                                     limit=args.limit_train_sequences)
                 for c in clients]
         model = fc.build_model(history.get("seed", 42))
