@@ -4,8 +4,10 @@
 
 Implements SPEC.md constraints 4-5:
   - Sequences: 16 contiguous frames at 2-min cadence — 4 input + 12 target.
-  - Center-crop each site frame from 300x300 to `--crop-size` (default 256)
-    before filtering and storage.
+  - Cut one `--crop-size` (default 256) crop from each 300x300 sequence
+    before filtering and storage: origin offset by 0..`--crop-jitter`
+    (default 31) pixels per axis for train/val, (0, 0) for test, the same
+    for every frame (author's configuration, AUTHOR_FEEDBACK.md Q2).
   - Precipitation-content filter over the whole 16-frame crop:
       R_sat = 1 - exp(-R/s)
       q = min(1, q_min + m * mean(R_sat))
@@ -30,6 +32,8 @@ import os
 import shutil
 import sys
 import time
+import zlib
+from datetime import datetime, timezone
 
 import numpy as np
 from netCDF4 import Dataset
@@ -51,7 +55,7 @@ EXPORT_FIELDS = (
     "site", "retained",
     "splits", "splits.train", "splits.val", "splits.test",
     "filter", "filter.scale", "filter.q_min", "filter.m",
-    "filter.threshold", "filter.crop_size",
+    "filter.threshold", "filter.crop_size", "filter.crop_jitter",
     "value_encoding", "value_encoding.dtype", "value_encoding.scale",
     "value_encoding.cap",
     "effective_cadence_s", "val_seed",
@@ -100,18 +104,32 @@ def iter_chunks(path, chunk_frames):
         nc.close()
 
 
-def center_crop(arr, size):
-    """Center-crop the last two (H, W) dims to size x size."""
-    h, w = arr.shape[-2], arr.shape[-1]
-    top = max(0, (h - size) // 2)
-    left = max(0, (w - size) // 2)
-    return arr[..., top:top + size, left:left + size]
+def is_test_day(epoch_s):
+    """Test split: the first TEST_DAYS days of each month (UTC)."""
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).day <= TEST_DAYS
+
+
+def crop_origin(epoch_s, site, seed, jitter, h, w, size):
+    """(row, col) origin of a sequence's crop (AUTHOR_FEEDBACK.md Q2).
+
+    The authors cut one size x size crop per 300x300 block with the row and
+    column origins independently offset by 0..jitter pixels for training
+    and validation, and at (0, 0) for test. The offset is drawn from an RNG
+    keyed on (seed, site, start time) rather than a running stream, so it
+    does not depend on chunking or on the order sequences are found.
+    """
+    if is_test_day(epoch_s):
+        return 0, 0
+    hi_r, hi_c = min(jitter, h - size), min(jitter, w - size)
+    rng = np.random.default_rng(
+        [seed, zlib.crc32(site.encode()), int(epoch_s)])
+    return (int(rng.integers(0, hi_r + 1)), int(rng.integers(0, hi_c + 1)))
 
 
 def scan_buffer(times, frames, cadence_s, tol,
                 filter_scale, filter_qmin, filter_m, filter_threshold,
-                crop_size,
-                out_seqs, out_starts, stats):
+                crop_size, crop_jitter, site, seed,
+                out_seqs, out_starts, out_origins, stats):
     """Extract sequences from a buffer; return first unconsumed index.
 
     The caller carries the unconsumed tail (< SEQ_LEN frames) into the
@@ -125,7 +143,9 @@ def scan_buffer(times, frames, cadence_s, tol,
             stats["gap_rejected"] += 1
             i += 1
             continue
-        window = center_crop(frames[i:i + SEQ_LEN], crop_size)
+        r0, c0 = crop_origin(window_t[0], site, seed, crop_jitter,
+                             frames.shape[-2], frames.shape[-1], crop_size)
+        window = frames[i:i + SEQ_LEN, r0:r0 + crop_size, c0:c0 + crop_size]
         quant = fc.encode_precip(window)
         rate = fc.decode_sequences(quant)
         r_sat = 1.0 - np.exp(-rate / filter_scale)
@@ -136,6 +156,7 @@ def scan_buffer(times, frames, cadence_s, tol,
             continue
         out_seqs.append(quant)
         out_starts.append(window_t[0])
+        out_origins.append((r0, c0))
         # Non-overlapping sequences: jump a full window.
         i += SEQ_LEN
     return i
@@ -169,6 +190,10 @@ def main():
     parser.add_argument("--output-manifest", required=True)
     parser.add_argument("--val-seed", type=int, required=True)
     parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--crop-jitter", type=int, default=31,
+                        help="Max per-axis crop-origin offset for train/val "
+                             "sequences (test: none). Default 31, the "
+                             "authors' value")
     parser.add_argument("--filter-scale", type=float, default=1.0)
     parser.add_argument("--filter-qmin", type=float, default=2e-4)
     parser.add_argument("--filter-m", type=float, default=0.1)
@@ -264,7 +289,7 @@ def main():
     del all_t, month_times
 
     # -- Pass 2: stream frames, extracting sequences as we go ---------------
-    sequences, starts = [], []
+    sequences, starts, origins = [], [], []
     stats = {"candidates": 0, "gap_rejected": 0, "filter_rejected": 0}
     carry_t = np.zeros(0, dtype=np.float64)
     carry_f = None
@@ -281,8 +306,9 @@ def main():
                                args.filter_qmin,
                                args.filter_m,
                                args.filter_threshold,
-                               args.crop_size,
-                               sequences, starts, stats)
+                               args.crop_size, args.crop_jitter,
+                               args.site, args.val_seed,
+                               sequences, starts, origins, stats)
             carry_t = buf_t[used:].copy()
             carry_f = buf_f[used:].copy()
             del buf_t, buf_f
@@ -310,10 +336,8 @@ def main():
 
     # -- Splits (SPEC constraint 5) -----------------------------------------
     split = np.zeros(n, dtype=np.int8)  # 0=train
-    day_of_month = np.array([
-        time.gmtime(t).tm_mday for t in start_arr
-    ]) if n else np.zeros(0)
-    split[day_of_month <= TEST_DAYS] = 2  # test
+    # Same rule crop_origin used to decide which sequences go unjittered.
+    split[np.array([is_test_day(t) for t in start_arr], dtype=bool)] = 2
 
     remainder = np.where(split == 0)[0]
     n_val = min(len(remainder), int(np.sum(split == 2)))
@@ -322,7 +346,9 @@ def main():
     split[val_idx] = 1  # val
 
     np.savez_compressed(seq_path, sequences=seq_arr,
-                        start_epoch=start_arr, split=split)
+                        start_epoch=start_arr, split=split,
+                        crop_origin=np.array(origins, dtype=np.int16
+                                             ).reshape(-1, 2))
 
     digest = hashlib.sha256(seq_arr.tobytes()).hexdigest()
     manifest = {
@@ -337,6 +363,7 @@ def main():
             "m": args.filter_m,
             "threshold": args.filter_threshold,
             "crop_size": args.crop_size,
+            "crop_jitter": args.crop_jitter,
         },
         "value_encoding": dict(fc.VALUE_ENCODING),
         "effective_cadence_s": cadence_s,

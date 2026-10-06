@@ -69,7 +69,13 @@ def load_benchmark(path):
                 for i in range(seqs.shape[0])]
 
 
-def forecast_steps_method(precip_in, n_members):
+# STEPS grid parameters. "paper" is what the authors ran: the PySTEPS
+# example's 2 km / 5 min, not MRMS's 1 km / 2 min (AUTHOR_FEEDBACK.md Q5).
+# "mrms" matches the data; the authors are re-running with it.
+STEPS_GRIDS = {"paper": (2.0, 5.0), "mrms": (1.0, CADENCE_S / 60.0)}
+
+
+def forecast_steps_method(precip_in, n_members, grid="paper"):
     """PySTEPS STEPS nowcast for one instance (paper Sec. IV-B.2)."""
     from pysteps import motion, nowcasts
     from pysteps.utils import transformation
@@ -79,15 +85,14 @@ def forecast_steps_method(precip_in, n_members):
                                            zerovalue=-15.0)
     db[~np.isfinite(db)] = -15.0
     oflow = motion.get_method("LK")(db)
-    # Paper-stated STEPS settings use 2 km / 5 min, even though MRMS inputs
-    # here are 1 km / 2 min; we match the stated configuration.
+    kmperpixel, timestep = STEPS_GRIDS[grid]
     nowcast = nowcasts.get_method("steps")(
         db, oflow, FORECAST_STEPS,
         n_ens_members=n_members,
         n_cascade_levels=6,
         precip_thr=meta["threshold"],
-        kmperpixel=2.0,
-        timestep=5.0,
+        kmperpixel=kmperpixel,
+        timestep=timestep,
         seed=24,
         ar_order=2,
         extrap_method="semilagrangian",
@@ -128,6 +133,10 @@ def main():
     parser.add_argument("--benchmark", required=True,
                         help="benchmark_sequences.npz from fetch_benchmark")
     parser.add_argument("--ensemble-size", type=int, required=True)
+    parser.add_argument("--steps-grid", choices=sorted(STEPS_GRIDS),
+                        default="paper",
+                        help="STEPS kmperpixel/timestep: 'paper' = 2 km / "
+                             "5 min as published, 'mrms' = 1 km / 2 min")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -161,7 +170,8 @@ def main():
         t0 = time.time()
         try:
             if args.method == "steps":
-                ens = forecast_steps_method(precip_in, args.ensemble_size)
+                ens = forecast_steps_method(precip_in, args.ensemble_size,
+                                            args.steps_grid)
             else:
                 ens = forecast_dgmr(model, precip_in, args.ensemble_size)
         except Exception as exc:  # noqa: BLE001

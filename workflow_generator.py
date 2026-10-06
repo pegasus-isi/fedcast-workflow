@@ -574,6 +574,7 @@ class FedCastWorkflow:
                     "--output-manifest", manifest,
                     "--val-seed", str(self.args.split_seed),
                     "--crop-size", str(self.args.model_size),
+                    "--crop-jitter", str(self.args.crop_jitter),
                     "--filter-scale", str(self.args.filter_scale),
                     "--filter-qmin", str(self.args.filter_qmin),
                     "--filter-m", str(self.args.filter_m),
@@ -990,6 +991,8 @@ class FedCastWorkflow:
             .add_outputs(forecasts, stage_out=False, register_replica=False)
             .add_pegasus_profiles(label=tag, tag=gpu_tag_for("mct_infer"))
         )
+        if method == "steps":
+            infer_job.add_args("--steps-grid", self.args.steps_grid)
         if ckpt is not None:
             infer_job.add_args("--checkpoint", ckpt)
             infer_job.add_inputs(ckpt)
@@ -1351,6 +1354,16 @@ your site catalog (hosted catalogs call it "compute") and adds
                              "(default: 2025, the paper's)")
     parser.add_argument("--rain-threshold", type=float, default=0.1,
                         help="Rain/no-rain threshold in mm/h (default: 0.1)")
+    parser.add_argument("--steps-grid", choices=["paper", "mrms"],
+                        default="paper",
+                        help="STEPS grid parameters: 'paper' = 2 km / 5 min "
+                             "as published (PySTEPS example values), 'mrms' "
+                             "= 1 km / 2 min matching the data "
+                             "(default: paper)")
+    parser.add_argument("--crop-jitter", type=int, default=31,
+                        help="Max per-axis crop-origin offset (px) for "
+                             "train/val sequences; test crops sit at (0, 0) "
+                             "(default: 31, the authors' configuration)")
     parser.add_argument("--filter-scale", type=float, default=1.0,
                         help="Preprocess filter R_sat scale s "
                              "(default: 1.0)")

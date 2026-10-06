@@ -424,10 +424,12 @@ framing.
     a modified architecture? *Our documented rule:* center-crop to 288×288
     (= 9×32) at the model boundary, applied identically to every method
     (including STEPS) so the evaluation grid stays uniform.~~
-    **RESOLVED (2026-10-06, author reply, see AUTHOR_FEEDBACK.md):** preprocessing
-    center-crops each 300×300 site frame to 256×256 and stores 16×256×256 sequences;
-    model-boundary center-crop remains in loaders as a no-op on new shards and for
-    backward compatibility with older shards.
+    **RESOLVED (2026-10-06, author replies, see AUTHOR_FEEDBACK.md):** preprocessing
+    cuts one 256×256 crop per 300×300 sequence and stores 16×256×256 sequences.
+    Following the second reply, train/val crop origins are offset 0–31 px per axis
+    (same for every frame; `--crop-jitter`), test crops sit at (0, 0); the first
+    implementation used a fixed center crop. The model-boundary center-crop
+    remains in loaders as a no-op on new shards and for older shards.
 
 12. **Client data placement.** ~~The per-round SubWorkflow structure gives each
     client its own job, but nothing made a client's shard *stay* anywhere: shards

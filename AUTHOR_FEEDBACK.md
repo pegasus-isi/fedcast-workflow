@@ -142,9 +142,13 @@ We train one model per (method, L) on the last L months. The paper trains
 2 + 16 + 8 + 4 + 2 + 1 = 33 date-tagged models per paradigm and pools all of them
 in E1's TOPSIS. Estimated E1 cost from the author's timings: about
 5 × (108 + 131) ≈ 1,200 A100-h (each fully tiled L costs about one 48-month run;
-L = 1 adds ~10 GPU-h). With E2.1 and E2.2 over all date tags, roughly
-3,000–4,000 A100-h. Deferred until the cost is reviewed; MGHPCC is the likely
-place to run it.
+L = 1 adds ~10 GPU-h). The second reply (Sec. 5) confirms E2.1 and both E2.2
+settings cover all 33 date tags, reusing the E1 centralized models (E2.1) and
+federated models (E2.2) as references — so the new training is 33 E2.1
+federated models (~660 A100-h) and 2 × 33 centralized-SAM models (~1,100 A100-h
+before SAM's roughly 2× step cost): about 3,000–4,000 A100-h in total. The
+L = 1 tags are 2022-02 and 2022-10. Deferred until the cost is reviewed; Unity
+(MGHPCC) is where it would run.
 
 ### Status
 
@@ -152,6 +156,8 @@ place to run it.
   CRPS normalization fix found while testing B: the spread term was K times too
   large, so CRPS went negative and rewarded noisier ensembles).
 - **C** not started.
+- Second reply (Sec. 5) implemented 2026-10-06: client crop jitter
+  (`--crop-jitter`, default 31) and `--steps-grid {paper,mrms}`.
 
 ## 3. Open questions for the author
 
@@ -184,5 +190,37 @@ These are documented choices, revisable when the author answers.
   complete sample whose targets still overlap the event window. The shift is
   recorded per event (`init_shift_s` in `benchmark_sequences.npz`); for
   20220307_2120 it is +14 min (frames 21:26–21:56).
-- **Event crop (Q2):** 256 × 256 on the 0.01° grid, centered on the centroid.
-  Client sequences use the center 256 × 256 of each 300 × 300 site window.
+- **Event crop (Q2):** 256 × 256 on the 0.01° grid, centered on the centroid
+  — confirmed by the second reply. (Client crops are no longer our rule; see
+  Sec. 5 item 2.)
+
+## 5. Second reply (2026-10-06) — answers to Sec. 3
+
+1. **Event timing — partly answered.** Frame layout confirmed: with t0 the last
+   input's valid time, inputs t0 − 6 … t0 and targets t0 + 2 … t0 + 24 (30 min
+   first to last). That is our layout. Where t0 sits relative to the 20-min
+   event window is still not stated, so our rule in Sec. 4 stands. **Ask again**,
+   with Q6.
+2. **Crops — answered.**
+   - Benchmark: the appendix centroid is the midpoint of the final crop's
+     bounding box, so the crop is centered on it. Matches ours.
+   - Clients: one 256 × 256 crop per 300 × 300 block, not tiles. Train and
+     validation origins are offset independently by 0–31 px per axis (the same
+     for every frame of the sequence); test crops sit at (0, 0) with no jitter.
+     We used a fixed center crop (origin 22, 22). **Changed:**
+     `preprocess_sequences --crop-jitter 31` draws each sequence's origin from
+     an RNG keyed on (split seed, site, start time), so shards stay
+     reproducible and independent of chunking. The origins are stored in the
+     shard (`crop_origin`). The filter runs on the jittered crop, as theirs did.
+3. **L = 1 tags — answered:** 2022-02 and 2022-10 (training-period end
+   months). Feeds item C.
+4. **E2.1 / E2.2 coverage — answered:** all 33 date/window combinations; E2.1
+   reuses the centralized reference models, both E2.2 settings reuse the
+   unchanged federated ones. Feeds item C (cost in Sec. 2 C).
+5. **STEPS — answered.** 2 km / 5 min came from the official PySTEPS STEPS
+   example; they affect velocity perturbation and incremental masking only, not
+   DGMR. The author will re-run STEPS with MRMS-matched parameters and
+   recompute the joint TOPSIS. **Changed:** `--steps-grid` chooses `paper`
+   (2 km / 5 min, default — reproduces what was published) or `mrms` (1 km /
+   2 min). Running both lets us check their sensitivity result independently.
+6. **MRMS gap in 20220307_2120 — not answered.** Ask again.
