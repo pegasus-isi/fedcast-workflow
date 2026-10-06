@@ -39,12 +39,10 @@ Phase A — Data construction (per site × month; 7 × 48 = 336 chunks)
                                     # test = first 3 calendar days of each month,
                                     # validation = fixed-seed sample of remainder
 
-Phase B — Event benchmark construction (once)
-  B1. fetch_wpc_mpd                 # WPC Mesoscale Precipitation Discussions (Iowa Mesonet)
-  B2. fetch_lsr                     # Local Storm Reports (Iowa Mesonet GeoJSON)
-  B3. fetch_storm_events            # NOAA/NCEI Storm Events Database CSVs
-  B4. build_event_table             # unify → {event ID, source, UTC window, footprint}
-  B5. compile_benchmark             # balanced event selection → fixed benchmark set B
+Phase B — Event benchmark (once)
+  B1. fetch_benchmark               # the paper's 12 frozen events (benchmark_events.csv):
+                                    # one 16-frame MRMS sample per event, 256x256
+                                    # centered on its centroid, one init per event
 
 Phase C — Training (per L; GPU jobs)
   C1. train_centralized(L)          # DGMR on pooled 7-site data, 100 epochs,
@@ -107,8 +105,7 @@ fedcast-workflow/
 │   │                          # (domain, month); fuses planned A1-A4
 │   ├── preprocess_sequences.py  # sequences, rain filter, frozen split,
 │   │                          # manifest; --silo-dir keeps the shard resident
-│   ├── fetch_events.py        # MPD / LSR / StormEvents (best-effort per source)
-│   ├── build_benchmark.py     # balanced event selection → benchmark set B
+│   ├── fetch_benchmark.py     # one MRMS sample per frozen benchmark event
 │   ├── train_dgmr.py          # centralized DGMR segment job (Lightning)
 │   ├── fl_init.py             # seeds the global model for an FL chain
 │   ├── fl_train_client.py     # one client's local epoch for one round
@@ -180,19 +177,25 @@ image the jobs run is the one on the submit host.
     not wall-clock, GPU-hours, or optimizer steps.
 
 **Evaluation**
-11. All three methods evaluated on the **same frozen event-driven benchmark**
-    (WPC MPD + LSR + NOAA Storm Events), same MCT pipeline, same TOPSIS criteria.
+11. All three methods evaluated on the **same frozen event-driven benchmark** — the
+    paper appendix's 12 events (`benchmark_events.csv`, AUTHOR_FEEDBACK.md), one
+    forecast initialization each — same MCT pipeline, same TOPSIS criteria. A
+    TOPSIS candidate is one trained model (plus STEPS), scored on its per-event
+    metrics averaged over the benchmark events.
 12. DGMR inference: K=6 stochastic ensemble (`num_samples=6`); ensemble mean for
     deterministic metrics; full ensemble for CRPS. STEPS: 20-member PySTEPS ensemble,
-    6 cascade levels, nonparametric noise, Bowler–Pierce–Seed velocity perturbations,
-    incremental precipitation mask.
+    Lucas–Kanade motion, 6 cascade levels, AR(2), semilagrangian extrapolation,
+    FFT decomposition, Gaussian bandpass, nonparametric noise, Bowler–Pierce–Seed
+    velocity perturbations, incremental precipitation mask, CDF probability matching,
+    precip threshold −10 dB (0.1 mm/h), kmperpixel=2.0, timestep=5 min, seed=24.
 13. Metrics computed **per lead time** then averaged over the 12 leads; rain/no-rain
     threshold θ = 0.1 mm/h; metric suite exactly per paper Table I.
 14. TOPSIS: objective-side-balanced weighting (benefit side and cost side each get
     total weight 0.5, split equally within side); vector normalization; ideals fitted
     per candidate pool; HK and BIAS converted to |x−1| deviations; no clipping or
-    epsilon stabilization. E1, E2.1, E2.2 are **separately normalized pools** — never
-    compare scores across pools.
+    epsilon stabilization. E1 and E2.1 each use one pool; E2.2 uses one pool per
+    SAM configuration ρ. Pools are separately normalized — never compare scores
+    across pools.
 15. Ablation definitions: E2.1 quadratic weighting `w_i = max(1, ⌊n_i²/n_max⌋)`
     (Eq. 8); E2.2 generator-side SAM at ρ ∈ {0.025, 0.0125} with everything else
     unchanged.
@@ -239,10 +242,10 @@ image the jobs run is the one on the submit host.
 6. **Storage/file layout, intermediate formats** (NetCDF chunking, tensor
    serialization), and the Flower version — any synchronous FedAvg-faithful
    implementation qualifies.
-7. **The paper's exact event count / benchmark composition**, since the balanced-
-   selection procedure is not fully specified (see §6). We freeze *our own*
-   benchmark set once and use it identically across all methods, which preserves
-   the paper's internal-validity design.
+7. ~~**The paper's exact event count / benchmark composition**~~ — no longer
+   free: the author supplied the 12 events (open question 5). What remains free
+   is the per-event spatial footprint, which is not public; we crop 256×256
+   around each centroid.
 8. **Privacy mechanisms.** The paper adds none (no DP, no secure aggregation); we
    don't either.
 
@@ -327,15 +330,20 @@ framing.
 
 ## 6. Open design questions
 
-1. **Which 48-month window?** The MRMS AWS archive begins 2020-10-14 and the paper's
+1. **Which 48-month window?** ~~The MRMS AWS archive begins 2020-10-14 and the paper's
    example event is dated 2024-01-10, but the exact study interval is unstated.
    *Proposal:* 2021-01 through 2024-12 (fully contained in the archive, contains the
-   Fig. 2 event). Needs confirmation — or contact with the authors.
-2. **Precipitation-content filter.** "Preprocessing filters out data with
+   Fig. 2 event). Needs confirmation — or contact with the authors.~~
+   **RESOLVED (2026-10-06, author reply, see AUTHOR_FEEDBACK.md):** study interval is
+   2020-11 through 2024-10.
+2. **Precipitation-content filter.** ~~"Preprocessing filters out data with
    insufficient precipitation information" is not quantified (no threshold, coverage
    fraction, or per-sequence rule given). This directly drives the retained-sequence
    counts in Tier 1. *Proposal:* calibrate a (rain-fraction ≥ p at θ = 0.1 mm/h)
-   rule to approximate the published counts, and document it as a deviation.
+   rule to approximate the published counts, and document it as a deviation.~~
+   **RESOLVED (2026-10-06, author reply, see AUTHOR_FEEDBACK.md):** apply the DGMR
+   statistic over the whole 16-frame crop: R_sat = 1 - exp(-R/s), s=1.0;
+   q = min(1, q_min + m*mean(R_sat)), q_min=2e-4, m=0.1; keep if q >= 8e-3.
 3. **PAHG (Alaska) coverage.** ~~Must verify PrecipRate exists for the Alaska
    domain over the chosen window.~~ **RESOLVED (2026-08-31, verified against the
    live bucket):** `ALASKA/PrecipRate_00.00/` exists with the same archive start
@@ -348,10 +356,20 @@ framing.
    (ensemble-mean thresholding order, per-event vs. pooled contingency tables,
    TOPSIS candidate-pool membership per "experiment bundle") must be inferred. Worth
    emailing the authors for the tool or the exact TOPSIS input tables.
-5. **Benchmark "balanced events" selection.** The compile step "balanced events →
+   **Mostly RESOLVED (2026-10-06, AUTHOR_FEEDBACK.md):** contingency scores per
+   event and lead, then averaged; ensemble mean before thresholding; pools as in
+   constraint 14; candidates are trained models. MCT source and TOPSIS input
+   tables remain non-public for now.
+5. **Benchmark "balanced events" selection.** ~~The compile step "balanced events →
    benchmark set B" (paper Fig. 3) doesn't specify balancing dimensions (per site?
    per season? per source?) or the event count. *Proposal:* balance per site ×
-   source, cap events per site, freeze with a fixed seed.
+   source, cap events per site, freeze with a fixed seed.~~ **RESOLVED (2026-10-06,
+   author reply, AUTHOR_FEEDBACK.md):** 12 events, two high-end and two median per
+   characteristic (intensity, density, complexity), listed in the appendix and
+   committed as `benchmark_events.csv`. Not tied to the client sites: 9 centroids
+   lie outside every client window and 3 events postdate the study interval, so
+   `fetch_benchmark` pulls each event's sample from MRMS directly. The MPD / LSR /
+   Storm Events sources and `build_benchmark` are gone.
 6. **Federated training inside Pegasus.** ~~Options: (a) one monolithic GPU job per
    (paradigm, L); (b) checkpointed segments; (c) per-round SubWorkflows with
    per-client jobs.~~ **DECIDED (2026-08-30): per-round SubWorkflows (c).** Each FL
@@ -389,19 +407,27 @@ framing.
    openclimatefix implementation + Lightning defaults; those defaults have changed
    across releases. Pin exact package versions (and record them in the containers)
    — which release corresponds to the paper is unknown.
-10. **Event-window → input-sequence mapping.** How MCT picks the forecast
+10. **Event-window → input-sequence mapping.** ~~How MCT picks the forecast
     initialization time(s) within each event's UTC window (one init per event?
     all inits in the window?) is unspecified; this changes per-event sample sizes.
     *Proposal:* all valid 16-frame sequences whose target window intersects the
-    event window, documented as our rule.
-11. **300×300 fields vs. DGMR's 32-divisibility requirement.** The openclimatefix
+    event window, documented as our rule.~~ **PARTLY RESOLVED (2026-10-06):** one
+    predefined initialization per event. Where it sits in the 20-min window is
+    not public; our rule takes the window start as the first target frame
+    (frames `start − 8 min .. start + 22 min`). Asked back (AUTHOR_FEEDBACK.md
+    Q1).
+11. **300×300 fields vs. DGMR's 32-divisibility requirement.** ~~The openclimatefix
     DGMR requires spatial dims divisible by 32 (its latent/conditioning stacks
     downsample by 32); 300×300 is not, and feeding it fails with a ConvGRU shape
     mismatch (confirmed empirically 2026-08-30). How did the paper feed 300×300
     MRMS windows into DGMR — padding to 320, resizing/cropping to 256 or 288, or
     a modified architecture? *Our documented rule:* center-crop to 288×288
     (= 9×32) at the model boundary, applied identically to every method
-    (including STEPS) so the evaluation grid stays uniform.
+    (including STEPS) so the evaluation grid stays uniform.~~
+    **RESOLVED (2026-10-06, author reply, see AUTHOR_FEEDBACK.md):** preprocessing
+    center-crops each 300×300 site frame to 256×256 and stores 16×256×256 sequences;
+    model-boundary center-crop remains in loaders as a no-op on new shards and for
+    backward compatibility with older shards.
 
 12. **Client data placement.** ~~The per-round SubWorkflow structure gives each
     client its own job, but nothing made a client's shard *stay* anywhere: shards
@@ -573,4 +599,5 @@ framing.
 - DGMR implementation: [openclimatefix/skillful_nowcasting](https://github.com/openclimatefix/skillful_nowcasting).
 - Federated framework: Flower (Beutel et al. 2020); FedAvg (McMahan et al.).
 - STEPS baseline: [PySTEPS](https://github.com/pySTEPS/pysteps).
-- Event sources: Iowa Mesonet WPC MPD + LSR services; NOAA/NCEI Storm Events CSVs.
+- Benchmark events: the paper appendix's 12-event table, via the author
+  (AUTHOR_FEEDBACK.md).

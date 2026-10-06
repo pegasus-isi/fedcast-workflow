@@ -4,17 +4,21 @@
 
 Implements SPEC.md constraints 4-5:
   - Sequences: 16 contiguous frames at 2-min cadence — 4 input + 12 target.
-  - Precipitation-content filter: a sequence is retained if at least
-    `--min-rain-fraction` of pixels exceed `--rain-threshold` mm/h in at
-    least one frame (calibration knob — SPEC open question 2; tune against
-    the paper's published retained-sequence counts).
+  - Center-crop each site frame from 300x300 to `--crop-size` (default 256)
+    before filtering and storage.
+  - Precipitation-content filter over the whole 16-frame crop:
+      R_sat = 1 - exp(-R/s)
+      q = min(1, q_min + m * mean(R_sat))
+      keep iff q >= threshold
+    with defaults s=1.0, q_min=2e-4, m=0.1, threshold=8e-3.
   - Split rule: test = first three available days of each month;
     validation = fixed-seed sample of the remainder, sized ~equal to test;
     everything else = train.
 
 Outputs:
-  - {site}_sequences.npz : arrays `sequences` (N, 16, 300, 300) float16,
-    `start_epoch` (N,), `split` (N,) in {0=train, 1=val, 2=test}
+  - {site}_sequences.npz : arrays `sequences` (N, 16, crop, crop) uint16
+    where one unit = 1/32 mm/h (capped at 128 mm/h), `start_epoch` (N,),
+    `split` (N,) in {0=train, 1=val, 2=test}
   - {site}_manifest.json : split membership, retention stats, SHA-256 of the
     sequence array — the Tier-0 determinism artifact (SPEC Sec. 5).
 """
@@ -46,10 +50,13 @@ logger = logging.getLogger(__name__)
 EXPORT_FIELDS = (
     "site", "retained",
     "splits", "splits.train", "splits.val", "splits.test",
-    "filter", "filter.rain_threshold_mmh", "filter.min_rain_fraction",
+    "filter", "filter.scale", "filter.q_min", "filter.m",
+    "filter.threshold", "filter.crop_size",
+    "value_encoding", "value_encoding.dtype", "value_encoding.scale",
+    "value_encoding.cap",
     "effective_cadence_s", "val_seed",
     "retention_stats", "retention_stats.candidates",
-    "retention_stats.gap_rejected", "retention_stats.rain_rejected",
+    "retention_stats.gap_rejected", "retention_stats.filter_rejected",
     "sequence_sha256",
     "silo", "silo.configured_dir", "silo.resolved_path", "silo.host",
     "silo.user", "silo.home",
@@ -93,7 +100,17 @@ def iter_chunks(path, chunk_frames):
         nc.close()
 
 
-def scan_buffer(times, frames, cadence_s, tol, thr, min_frac,
+def center_crop(arr, size):
+    """Center-crop the last two (H, W) dims to size x size."""
+    h, w = arr.shape[-2], arr.shape[-1]
+    top = max(0, (h - size) // 2)
+    left = max(0, (w - size) // 2)
+    return arr[..., top:top + size, left:left + size]
+
+
+def scan_buffer(times, frames, cadence_s, tol,
+                filter_scale, filter_qmin, filter_m, filter_threshold,
+                crop_size,
                 out_seqs, out_starts, stats):
     """Extract sequences from a buffer; return first unconsumed index.
 
@@ -108,13 +125,16 @@ def scan_buffer(times, frames, cadence_s, tol, thr, min_frac,
             stats["gap_rejected"] += 1
             i += 1
             continue
-        window = frames[i:i + SEQ_LEN]
-        wet = np.nanmean(window > thr, axis=(1, 2))
-        if np.nanmax(wet) < min_frac:
-            stats["rain_rejected"] += 1
+        window = center_crop(frames[i:i + SEQ_LEN], crop_size)
+        quant = fc.encode_precip(window)
+        rate = fc.decode_sequences(quant)
+        r_sat = 1.0 - np.exp(-rate / filter_scale)
+        q = min(1.0, filter_qmin + filter_m * float(np.mean(r_sat)))
+        if q < filter_threshold:
+            stats["filter_rejected"] += 1
             i += 1
             continue
-        out_seqs.append(np.nan_to_num(window).astype(np.float16))
+        out_seqs.append(quant)
         out_starts.append(window_t[0])
         # Non-overlapping sequences: jump a full window.
         i += SEQ_LEN
@@ -148,8 +168,11 @@ def main():
     parser.add_argument("--output-sequences", required=True)
     parser.add_argument("--output-manifest", required=True)
     parser.add_argument("--val-seed", type=int, required=True)
-    parser.add_argument("--rain-threshold", type=float, default=0.1)
-    parser.add_argument("--min-rain-fraction", type=float, default=0.05)
+    parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--filter-scale", type=float, default=1.0)
+    parser.add_argument("--filter-qmin", type=float, default=2e-4)
+    parser.add_argument("--filter-m", type=float, default=0.1)
+    parser.add_argument("--filter-threshold", type=float, default=8e-3)
     parser.add_argument("--chunk-frames", type=int, default=512,
                         help="Frames read per streaming block (default: "
                              "512 ~ 184 MB at 300x300 float32)")
@@ -208,7 +231,7 @@ def main():
         logger.error("No usable input months for %s", args.site)
         # Write declared outputs before failing (SPEC constraint 17).
         np.savez_compressed(seq_path,
-                            sequences=np.zeros((0,), dtype=np.float16),
+                            sequences=np.zeros((0,), dtype=np.uint16),
                             start_epoch=np.zeros((0,)),
                             split=np.zeros((0,), dtype=np.int8))
         # Named rather than inline so tools/check_export_docs.py can see
@@ -242,7 +265,7 @@ def main():
 
     # -- Pass 2: stream frames, extracting sequences as we go ---------------
     sequences, starts = [], []
-    stats = {"candidates": 0, "gap_rejected": 0, "rain_rejected": 0}
+    stats = {"candidates": 0, "gap_rejected": 0, "filter_rejected": 0}
     carry_t = np.zeros(0, dtype=np.float64)
     carry_f = None
     warned_mem = False
@@ -254,17 +277,23 @@ def main():
                 buf_t = np.concatenate([carry_t, c_t])
                 buf_f = np.concatenate([carry_f, c_f], axis=0)
             used = scan_buffer(buf_t, buf_f, cadence_s, cadence_tol_s,
-                               args.rain_threshold,
-                               args.min_rain_fraction,
+                               args.filter_scale,
+                               args.filter_qmin,
+                               args.filter_m,
+                               args.filter_threshold,
+                               args.crop_size,
                                sequences, starts, stats)
             carry_t = buf_t[used:].copy()
             carry_f = buf_f[used:].copy()
             del buf_t, buf_f
-            mem_gb = len(sequences) * SEQ_LEN * 300 * 300 * 2 / 1e9
+            mem_gb = (
+                len(sequences) * SEQ_LEN * args.crop_size * args.crop_size * 2
+                / 1e9
+            )
             if mem_gb > 6.0 and not warned_mem:
                 logger.warning("%s: retained sequences already ~%.1f GB in "
-                               "RAM — consider a stricter "
-                               "--min-rain-fraction", args.site, mem_gb)
+                               "RAM — consider a stricter --filter-threshold",
+                               args.site, mem_gb)
                 warned_mem = True
         logger.info("%s: %s done — %d sequences so far",
                     args.site, path, len(sequences))
@@ -275,7 +304,8 @@ def main():
         logger.error("Zero retained sequences for %s", args.site)
 
     seq_arr = (np.stack(sequences) if n
-               else np.zeros((0, SEQ_LEN, 1, 1), dtype=np.float16))
+               else np.zeros((0, SEQ_LEN, args.crop_size, args.crop_size),
+                             dtype=np.uint16))
     start_arr = np.array(starts)
 
     # -- Splits (SPEC constraint 5) -----------------------------------------
@@ -301,8 +331,14 @@ def main():
         "splits": {"train": int(np.sum(split == 0)),
                    "val": int(np.sum(split == 1)),
                    "test": int(np.sum(split == 2))},
-        "filter": {"rain_threshold_mmh": args.rain_threshold,
-                   "min_rain_fraction": args.min_rain_fraction},
+        "filter": {
+            "scale": args.filter_scale,
+            "q_min": args.filter_qmin,
+            "m": args.filter_m,
+            "threshold": args.filter_threshold,
+            "crop_size": args.crop_size,
+        },
+        "value_encoding": dict(fc.VALUE_ENCODING),
         "effective_cadence_s": cadence_s,
         "val_seed": args.val_seed,
         "retention_stats": stats,

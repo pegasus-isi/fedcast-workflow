@@ -20,8 +20,8 @@ Phase A  fetch_crop_mrms   one job per (domain, month): MRMS PrecipRate from
                            with --silos: pinned to the site's silo, and
                            the shard stays there; silo_export then copies
                            it out for the pooled consumers only
-Phase B  fetch_events      WPC MPD, LSR, Storm Events (best-effort each)
-         build_benchmark   frozen, balanced event set B
+Phase B  fetch_benchmark   the paper's 12 frozen events: one 16-frame
+                           MRMS sample each, centered on the event
 Phase C  train_dgmr        centralized DGMR per interval L, as chains of
                            checkpointed segment jobs
          fl_* + SubWorkflows  federated DGMR per interval L: fl_init, then
@@ -68,11 +68,11 @@ python3 workflow_generator.py --test
 pegasus-plan --submit -s compute --output-dir output workflow.yml
 
 # 4. Full E1 reproduction
-python3 workflow_generator.py --start-month 2021-01 --months 48
+python3 workflow_generator.py --start-month 2020-11 --months 48
 pegasus-plan --submit -s compute --output-dir output workflow.yml
 
 # 5. With ablations
-python3 workflow_generator.py --start-month 2021-01 --months 48 \
+python3 workflow_generator.py --start-month 2020-11 --months 48 \
     --experiments e1 e21 e22
 ```
 
@@ -89,14 +89,14 @@ Or run the wrappers directly without Pegasus/HTCondor:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--start-month` | 2021-01 | Archive start (SPEC open question 1) |
+| `--start-month` | 2020-11 | Archive start |
 | `--months` | 48 | Archive length |
 | `--sites` | all 7 | Radar sites / federated clients |
 | `--intervals` | 1 3 6 12 24 48 | Training intervals L (months) |
 | `--rounds` | 100 | FL rounds / centralized epochs |
 | `--segment-size` | 10 | Rounds/epochs per training segment job |
-| `--experiments` | e1 | Pools: `e1`, `e21` (quadratic), `e22` (SAM) |
-| `--min-rain-fraction` | 0.05 | Sequence retention filter (open question 2) |
+| `--experiments` | e1 | Pools: `e1`, `e21` (quadratic), `e22_*` (one per SAM ρ) |
+| `--filter-threshold` | 8e-3 | Sequence retention keep threshold `q >= threshold` |
 | `--frame-stride` | 1 | Subsample MRMS cadence (pilot runs) |
 | `--shared-filesystem` | — | Workers can read the submit host; skip staging inputs |
 | `--runtime-scale` | 1.0 | Multiply every job's wall-clock budget |
@@ -256,7 +256,7 @@ the federated arm, but "only weights" would be wrong. The complete list:
 |---|---|---|
 | `fl_train_client` | every round | the post-local-training model weights, and a metadata JSON of `site`, `round`, `n_train` — the client's retained training-sequence count, which the aggregator needs for the quadratic-weighting ablation (Eq. 8) |
 | `fl_validate_client` | validation rounds | `site`, `round`, `n_val`, `n_batches`, `sum_loss`, `mean_loss` — counts and losses over the client's validation split |
-| `preprocess_sequences` | once | the split manifest, staged out as a reproduction artifact (SPEC Tier 0/1). The largest metadata export, and every field of it by full path: `site`; `retained`; `splits`, `splits.train`, `splits.val`, `splits.test`; `filter`, `filter.rain_threshold_mmh`, `filter.min_rain_fraction`; `val_seed`; `effective_cadence_s`; `retention_stats`, `retention_stats.candidates`, `retention_stats.gap_rejected`, `retention_stats.rain_rejected` — how many candidate sequences the site had and why each was dropped; `sequence_sha256`, a digest of the sequence array alone and **not** of the shard file, whose timestamps and split labels it does not cover; `silo`, `silo.configured_dir`, `silo.resolved_path`, `silo.host`, `silo.user`, `silo.home` — the shard's on-worker path and the identity that resolved it; and the per-sequence `start_epochs` and `split_labels` vectors, a timestamp and split label for **every retained sequence at that site** |
+| `preprocess_sequences` | once | the split manifest, staged out as a reproduction artifact (SPEC Tier 0/1). The largest metadata export, and every field of it by full path: `site`; `retained`; `splits`, `splits.train`, `splits.val`, `splits.test`; `filter`, `filter.scale`, `filter.q_min`, `filter.m`, `filter.threshold`, `filter.crop_size`; `value_encoding`, `value_encoding.dtype`, `value_encoding.scale`, `value_encoding.cap`; `val_seed`; `effective_cadence_s`; `retention_stats`, `retention_stats.candidates`, `retention_stats.gap_rejected`, `retention_stats.filter_rejected` — how many candidate sequences the site had and why each was dropped; `sequence_sha256`, a digest of the sequence array alone and **not** of the shard file, whose timestamps and split labels it does not cover; `silo`, `silo.configured_dir`, `silo.resolved_path`, `silo.host`, `silo.user`, `silo.home` — the shard's on-worker path and the identity that resolved it; and the per-sequence `start_epochs` and `split_labels` vectors, a timestamp and split label for **every retained sequence at that site** |
 | `preprocess_sequences` | once, only when a site has no usable input | a stand-in manifest of `site` and `error`, written so the declared output exists before the job fails (SPEC constraint 17) |
 | `silo_export` | once | the entire shard, for the centralized baseline and MCT evaluation |
 
@@ -372,7 +372,7 @@ cp silos.example.yml silos.yml                  # your own machine names
 curl -O https://raw.githubusercontent.com/pegasushub/pegasus-site-catalogs/main/conf/unity.yml
 ./custom_sites.py --style slurm --base unity.yml --silos silos.yml   # tags
 tools/silo_check.py --style slurm silos.yml     # confirm the cluster matches
-python3 workflow_generator.py --start-month 2021-01 --months 48 \
+python3 workflow_generator.py --start-month 2020-11 --months 48 \
     --silos silos.yml --base-catalog unity.yml
 pegasus-plan --submit -s compute --output-dir output workflow.yml
 ```
@@ -551,10 +551,11 @@ a long run.
 - `{site}_manifest.json` — frozen split manifests with SHA-256 (Tier 0/1).
   In cross-silo runs each also records where the shard landed and which
   host, job user and `HOME` resolved that path.
-- `benchmark_events.csv` — frozen event benchmark set B
+- `benchmark_sequences.npz` — the 12 benchmark event samples, as evaluated
 - `{method}_L{L}_best.ckpt` — best-validation-loss checkpoints
-- `{method}_L{L}_metrics.csv`, `steps_metrics.csv` — per-instance metrics
-- `e1_topsis.csv` (+ `e21`/`e22`) — per-pool TOPSIS scores
+- `{method}_L{L}_metrics.csv`, `steps_metrics.csv` — per-event metrics
+- `e1_topsis.csv` (+ `e21`/`e22_*`) — per-pool TOPSIS scores, one row per
+  trained model (metrics averaged over the benchmark events)
 - `figures.tar.gz` — learning-curve plots + summary table
 - `validation_report.md` — SPEC Sec. 5 gate results
 
@@ -601,8 +602,13 @@ configuration file, not the parent's. Re-run the generator after changing
   explicit error).
 - **Validation loss** uses the grid-cell-regularizer term of the paper's
   Eq. 3; the discriminator hinge term still needs to be added.
-- The precipitation-content filter and benchmark balancing rules are
-  documented defaults pending author responses (SPEC open questions 2, 5).
+- The precipitation filter and the benchmark come from the author's reply
+  (AUTHOR_FEEDBACK.md). Where each event's forecast starts inside its
+  window, and its exact footprint, are still our rules (SPEC open
+  question 10).
+- E1 trains one model per (method, L) on the last L months; the paper
+  trains 33 date-tagged rolling-window models per method
+  (AUTHOR_FEEDBACK.md, item C). Not yet implemented.
 - Container package versions are unpinned until the paper's exact releases
   are known (SPEC open question 9).
 - Cross-silo mode makes the *shards* resident, not the ingest: MRMS is

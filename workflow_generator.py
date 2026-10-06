@@ -9,7 +9,8 @@ See SPEC.md for the full design, constraints, and validation criteria.
 
 Pipeline phases (SPEC.md Sec. 1.1):
   A. Data       — fetch+crop MRMS per (site, month), build sequences per site
-  B. Benchmark  — fetch WPC MPD / LSR / StormEvents, compile frozen event set
+  B. Benchmark  — fetch a 16-frame MRMS sample for each of the paper's 12
+                  frozen benchmark events (benchmark_events.csv)
   C. Training   — per interval L: centralized DGMR and federated DGMR (Flower),
                   as chains of checkpointed segment jobs (SPEC open question 6b)
   D. Evaluation — MCT-style inference + verification per (method, L), TOPSIS
@@ -30,15 +31,15 @@ Usage:
     pegasus-plan --submit -s compute --output-dir output workflow.yml
 
     # Full E1 reproduction (7 sites, 48 months, 100 rounds/epochs):
-    ./workflow_generator.py --start-month 2021-01 --months 48
+    ./workflow_generator.py --start-month 2020-11 --months 48
 
     # Include ablations:
-    ./workflow_generator.py --start-month 2021-01 --months 48 \
+    ./workflow_generator.py --start-month 2020-11 --months 48 \
         --experiments e1 e21 e22
 
     # Cross-silo placement (the site catalog defines the silo tags):
     ./custom_sites.py --style slurm --silos silos.yml
-    ./workflow_generator.py --start-month 2021-01 --months 48 \
+    ./workflow_generator.py --start-month 2020-11 --months 48 \
         --silos silos.yml
 """
 
@@ -91,7 +92,8 @@ SITES = {
              "desc": "high-latitude coastal/mountainous (Kenai, AK)"},
 }
 
-EVENT_SOURCES = ["mpd", "lsr", "storm_events"]
+# The paper appendix's frozen 12-event benchmark (AUTHOR_FEEDBACK.md).
+BENCHMARK_EVENTS_LFN = "benchmark_events.csv"
 
 # Per-tool resource configuration: the only resource statements the
 # workflow makes. Everything scheduler-specific (queue/partition, account,
@@ -108,10 +110,8 @@ TOOL_CONFIGS = {
                              "runtime": 6 * 3600},
     "preprocess_sequences": {"memory": "16 GB", "cores": 4, "container": "data",
                              "runtime": 4 * 3600},
-    "fetch_events":         {"memory": "2 GB",  "cores": 1, "container": "data",
-                             "runtime": 3600},
-    "build_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data",
-                             "runtime": 1800},
+    "fetch_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data",
+                             "runtime": 2 * 3600},
     "train_dgmr":           {"memory": "32 GB", "cores": 8, "container": "train",
                              "gpus": 1, "runtime": 12 * 3600},
     "fl_init":              {"memory": "8 GB",  "cores": 2, "container": "train",
@@ -440,6 +440,10 @@ class FedCastWorkflow:
             "local", COMMON_LFN,
             "file://" + os.path.join(self.wf_dir, "bin", COMMON_LFN),
         )
+        self.rc.add_replica(
+            "local", BENCHMARK_EVENTS_LFN,
+            "file://" + os.path.join(self.wf_dir, BENCHMARK_EVENTS_LFN),
+        )
 
     # ------------------------------------------------------------------
     # Sub-workflow planning configuration: FL-round SubWorkflows are
@@ -535,8 +539,11 @@ class FedCastWorkflow:
                     "--output-sequences", sequences,
                     "--output-manifest", manifest,
                     "--val-seed", str(self.args.split_seed),
-                    "--rain-threshold", str(self.args.rain_threshold),
-                    "--min-rain-fraction", str(self.args.min_rain_fraction),
+                    "--crop-size", str(self.args.model_size),
+                    "--filter-scale", str(self.args.filter_scale),
+                    "--filter-qmin", str(self.args.filter_qmin),
+                    "--filter-m", str(self.args.filter_m),
+                    "--filter-threshold", str(self.args.filter_threshold),
                 )
                 # fedcast_common provides the export-surface check the
                 # wrapper runs before writing its manifest.
@@ -601,48 +608,28 @@ class FedCastWorkflow:
 
     # -- Phase B: event benchmark ---------------------------------------
     def _add_phase_b_benchmark(self):
-        source_files = []
-        for source in EVENT_SOURCES:
-            events = File(f"events_{source}.json")
-            job = (
-                Job("fetch_events",
-                    _id=f"fetch_events_{source}",
-                    node_label=f"fetch_events_{source}")
-                .add_args(
-                    "--source", source,
-                    "--start-month", self.months[0],
-                    "--end-month", self.months[-1],
-                    "--output", events,
-                )
-                .add_outputs(events, stage_out=False, register_replica=False)
-                # Best-effort source: wrapper degrades gracefully (empty
-                # output + exit 0); build_benchmark fails only if ALL
-                # sources are empty (SPEC constraint 17).
-                .add_dagman_profile(retry="2")
-            )
-            self.wf.add_jobs(job)
-            source_files.append(events)
-
-        self.benchmark_file = File("benchmark_events.csv")
+        # One job fetches all 12 events' samples straight from MRMS: the
+        # benchmark is independent of the clients (most centroids are
+        # outside every client window, some events postdate the study
+        # interval), so it cannot be cut from their shards.
+        self.benchmark_file = File("benchmark_sequences.npz")
+        events = File(BENCHMARK_EVENTS_LFN)
         bench_job = (
-            Job("build_benchmark",
-                _id="build_benchmark", node_label="build_benchmark")
+            Job("fetch_benchmark",
+                _id="fetch_benchmark", node_label="fetch_benchmark")
             .add_args(
+                "--events", events,
+                "--crop-size", str(self.args.model_size),
                 "--output", self.benchmark_file,
-                "--seed", str(self.args.split_seed),
-                "--max-events-per-site", str(self.args.max_events_per_site),
             )
-            .add_inputs(*source_files)
+            .add_inputs(events, File(COMMON_LFN))
             .add_outputs(self.benchmark_file, stage_out=True,
                          register_replica=False)
+            # Required source: the wrapper writes its output and exits
+            # non-zero when an event is incomplete; retry covers S3
+            # transients beyond its own backoff.
+            .add_dagman_profile(retry="2")
         )
-        for f in source_files:
-            bench_job.add_args("--events", f)
-        for site in self.sites:
-            info = SITES[site]
-            bench_job.add_args(
-                "--site", f"{site}:{info['lat']}:{info['lon']}"
-            )
         self.wf.add_jobs(bench_job)
 
     # -- Phase C: training ------------------------------------------------
@@ -956,11 +943,6 @@ class FedCastWorkflow:
         tag = f"{method}_L{interval}" if interval else method
         forecasts = File(f"{tag}_forecasts.npz")
 
-        seq_inputs = []
-        for site in self.sites:
-            seq_inputs.append(self.site_files[site]["sequences"])
-            seq_inputs.append(self.site_files[site]["manifest"])
-
         infer_job = (
             Job("mct_infer", _id=f"infer_{tag}", node_label=f"infer_{tag}")
             .add_args(
@@ -970,22 +952,13 @@ class FedCastWorkflow:
                 str(20 if method == "steps" else self.args.dgmr_ensemble),
                 "--output", forecasts,
             )
-            .add_inputs(self.benchmark_file, *seq_inputs)
+            .add_inputs(self.benchmark_file, File(COMMON_LFN))
             .add_outputs(forecasts, stage_out=False, register_replica=False)
             .add_pegasus_profiles(label=tag, tag=gpu_tag_for("mct_infer"))
         )
-        for site in self.sites:
-            infer_job.add_args(
-                "--client",
-                f"{site}:{self.site_files[site]['sequences'].lfn}"
-                f":{self.site_files[site]['manifest'].lfn}",
-            )
         if ckpt is not None:
             infer_job.add_args("--checkpoint", ckpt)
             infer_job.add_inputs(ckpt)
-        if self.args.fallback_test_instances:
-            infer_job.add_args("--fallback-test-instances",
-                               str(self.args.fallback_test_instances))
         self.wf.add_jobs(infer_job)
 
         metrics = File(f"{tag}_metrics.csv")
@@ -994,22 +967,15 @@ class FedCastWorkflow:
             .add_args(
                 "--method", method,
                 "--forecasts", forecasts,
-                "--benchmark", self.benchmark_file,
                 "--rain-threshold", str(self.args.rain_threshold),
                 "--output", metrics,
             )
-            .add_inputs(forecasts, self.benchmark_file, *seq_inputs)
+            .add_inputs(forecasts)
             .add_outputs(metrics, stage_out=True, register_replica=False)
             .add_pegasus_profiles(label=tag)
         )
         if interval:
             verify_job.add_args("--interval", str(interval))
-        for site in self.sites:
-            verify_job.add_args(
-                "--client",
-                f"{site}:{self.site_files[site]['sequences'].lfn}"
-                f":{self.site_files[site]['manifest'].lfn}",
-            )
         self.wf.add_jobs(verify_job)
 
         self.metric_files.setdefault(method, {})[interval] = metrics
@@ -1024,27 +990,28 @@ class FedCastWorkflow:
 
         # TOPSIS pools — separately normalized per experiment (SPEC
         # constraint 14). E1: cen+fed+steps; E2.1: fedq+cen+steps;
-        # E2.2: censam*+fed+steps.
+        # E2.2: one pool per SAM rho: censam{rho}+fed+steps.
         pools = {}
         if "e1" in self.experiments:
             pools["e1"] = ["cen", "fed"]
         if "e21" in self.experiments:
             pools["e21"] = ["cen", "fedq"]
         if "e22" in self.experiments:
-            pools["e22"] = ["fed"] + [
-                f"censam{str(rho).replace('0.', '')}"
-                for rho in self.args.sam_rho
-            ]
+            for rho in self.args.sam_rho:
+                rho_tag = str(rho).replace("0.", "")
+                pools[f"e22_{rho_tag}"] = ["fed", f"censam{rho_tag}"]
 
         topsis_files = []
         for pool_name, methods in pools.items():
-            pool_inputs = [steps_metrics]
+            pool_inputs = [steps_metrics, self.benchmark_file]
             topsis_out = File(f"{pool_name}_topsis.csv")
             topsis_job = (
                 Job("mct_topsis",
                     _id=f"topsis_{pool_name}",
                     node_label=f"topsis_{pool_name}")
-                .add_args("--pool", pool_name, "--output", topsis_out)
+                .add_args("--pool", pool_name,
+                          "--benchmark", self.benchmark_file,
+                          "--output", topsis_out)
                 .add_outputs(topsis_out, stage_out=True,
                              register_replica=False)
             )
@@ -1278,9 +1245,9 @@ def main():
         epilog="""
 Examples:
   %(prog)s --test                          # pilot: 2 sites, 1 month, tiny budget
-  %(prog)s --start-month 2021-01 --months 48
-  %(prog)s --start-month 2021-01 --months 48 --experiments e1 e21 e22
-  %(prog)s --start-month 2021-01 --months 48 --silos silos.yml
+  %(prog)s --start-month 2020-11 --months 48
+  %(prog)s --start-month 2020-11 --months 48 --experiments e1 e21 e22
+  %(prog)s --start-month 2020-11 --months 48 --silos silos.yml
 
 Then plan with the command this prints; it names the execution site from
 your site catalog (hosted catalogs call it "compute") and adds
@@ -1313,9 +1280,9 @@ your site catalog (hosted catalogs call it "compute") and adds
                              "it automatically.")
 
     # --- Data / archive ---
-    parser.add_argument("--start-month", type=str, default="2021-01",
-                        help="Archive start month YYYY-MM (default: 2021-01; "
-                             "SPEC open question 1)")
+    parser.add_argument("--start-month", type=str, default="2020-11",
+                        help="Archive start month YYYY-MM "
+                             "(default: 2020-11)")
     parser.add_argument("--months", type=int, default=48,
                         help="Archive length in months (default: 48)")
     parser.add_argument("--sites", type=str, nargs="+",
@@ -1344,18 +1311,24 @@ your site catalog (hosted catalogs call it "compute") and adds
     parser.add_argument("--train-seed", type=int, default=42,
                         help="Training RNG seed, recorded in run metadata")
 
-    # --- Preprocessing / evaluation knobs (SPEC open questions 2, 5) ---
-    parser.add_argument("--split-seed", type=int, default=1337,
-                        help="Seed for validation-split sampling and "
-                             "benchmark event selection")
+    # --- Preprocessing / evaluation knobs ---
+    parser.add_argument("--split-seed", type=int, default=2025,
+                        help="Seed for validation-split sampling "
+                             "(default: 2025, the paper's)")
     parser.add_argument("--rain-threshold", type=float, default=0.1,
                         help="Rain/no-rain threshold in mm/h (default: 0.1)")
-    parser.add_argument("--min-rain-fraction", type=float, default=0.05,
-                        help="Min wet-pixel fraction for sequence retention "
-                             "(calibration knob; SPEC open question 2)")
-    parser.add_argument("--max-events-per-site", type=int, default=20,
-                        help="Benchmark balancing cap per site "
-                             "(SPEC open question 5)")
+    parser.add_argument("--filter-scale", type=float, default=1.0,
+                        help="Preprocess filter R_sat scale s "
+                             "(default: 1.0)")
+    parser.add_argument("--filter-qmin", type=float, default=2e-4,
+                        help="Preprocess filter q_min offset "
+                             "(default: 2e-4)")
+    parser.add_argument("--filter-m", type=float, default=0.1,
+                        help="Preprocess filter multiplier m "
+                             "(default: 0.1)")
+    parser.add_argument("--filter-threshold", type=float, default=8e-3,
+                        help="Preprocess keep threshold on q "
+                             "(default: 8e-3)")
     parser.add_argument("--dgmr-ensemble", type=int, default=6,
                         help="DGMR stochastic ensemble size K (default: 6)")
     parser.add_argument("--frame-stride", type=int, default=1,
@@ -1364,10 +1337,9 @@ your site catalog (hosted catalogs call it "compute") and adds
     parser.add_argument("--limit-train-sequences", type=int, default=None,
                         help="PILOT/TIMING ONLY: cap train/val sequences "
                              "per client in training jobs")
-    parser.add_argument("--model-size", type=int, default=288,
+    parser.add_argument("--model-size", type=int, default=256,
                         help="DGMR spatial grid; must be divisible by 32 "
-                             "(default: 288 = paper-fidelity crop of the "
-                             "300x300 window)")
+                             "(default: 256 = paper crop size)")
     parser.add_argument("--batch-size", type=int, default=2,
                         help="Training batch size (default: 2)")
     parser.add_argument("--max-job-memory-gb", type=int, default=None,
@@ -1382,9 +1354,6 @@ your site catalog (hosted catalogs call it "compute") and adds
     parser.add_argument("--retries", type=int, default=1,
                         help="DAGMan retries per job; a retry doubles the "
                              "job's runtime budget (default: 1)")
-    parser.add_argument("--fallback-test-instances", type=int, default=0,
-                        help="PILOT ONLY: mct_infer falls back to N test "
-                             "sequences per site when no event matches")
     parser.add_argument("--max-concurrent-jobs", type=int, default=20,
                         help="DAGMan job throttle (default: 20)")
 
@@ -1440,18 +1409,14 @@ your site catalog (hosted catalogs call it "compute") and adds
 
     if args.test:
         args.sites = ["KTLX", "KENX"]
-        # 2024-01 is a month verified to contain in-window benchmark
-        # events for these sites (winter months often have none).
         args.start_month = "2024-01"
         args.months = 1
         args.intervals = [1]
         args.rounds = 2
         args.segment_size = 1
         args.validate_every = 1
-        args.max_events_per_site = 2
         args.frame_stride = 15
         args.limit_train_sequences = 4
-        args.fallback_test_instances = 2
         args.model_size = 128
         args.batch_size = 1
         args.max_job_memory_gb = 8

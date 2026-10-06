@@ -74,13 +74,18 @@ def categorical_scores(h, m, fa, cn):
 
 
 def crps_ensemble(ens, obs):
-    """Ensemble CRPS averaged over pixels (fair, standard estimator)."""
+    """Ensemble CRPS averaged over pixels: E|X-y| - 0.5 E|X-X'|.
+
+    The standard (not "fair") estimator, with E|X-X'| averaged over all
+    K^2 member pairs — the form pysteps' probscores.CRPS computes. Never
+    negative.
+    """
     k = ens.shape[0]
     term1 = np.mean(np.abs(ens - obs[None]), axis=0)
     term2 = 0.0
     for i in range(k):
         term2 = term2 + np.mean(np.abs(ens[i][None] - ens), axis=0)
-    return float(np.mean(term1 - 0.5 * term2 / 1.0))
+    return float(np.mean(term1 - 0.5 * term2 / k))
 
 
 def psnr(fcst, obs, data_range):
@@ -109,8 +114,6 @@ def main():
     # empty-string arguments when serializing job args.
     parser.add_argument("--interval", nargs="?", const="", default="")
     parser.add_argument("--forecasts", required=True)
-    parser.add_argument("--benchmark", required=True)  # provenance input
-    parser.add_argument("--client", action="append", default=[])
     parser.add_argument("--rain-threshold", type=float, default=0.1)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

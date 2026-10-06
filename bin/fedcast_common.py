@@ -18,17 +18,16 @@ INPUT_FRAMES = 4
 FORECAST_STEPS = 12
 GRID_LAMBDA = 20.0  # grid-cell regularizer weight (paper Sec. IV-C)
 
-# DGMR's latent/conditioning stacks require spatial dims divisible by 32;
-# 300 is not, so we center-crop the 300x300 windows to 288x288 (= 9 * 32),
-# the largest fitting size. Documented deviation — how the paper fed
-# 300x300 fields into DGMR is an open author question (SPEC Sec. 6).
+# DGMR's latent/conditioning stacks require spatial dims divisible by 32.
+# Sequence preprocessing center-crops site frames to 256x256 by default, and
+# consumers keep this center-crop at model boundary so older shards still work.
 #
 # FEDCAST_MODEL_SIZE / FEDCAST_BATCH_SIZE are PILOT-ONLY overrides for
 # CPU/low-memory smoke tests (e.g. 128 / 1). Reproduction runs must use
-# the 288 / 2 defaults.
-MODEL_SIZE = int(os.environ.get("FEDCAST_MODEL_SIZE", "288"))
+# the 256 / 2 defaults.
+MODEL_SIZE = int(os.environ.get("FEDCAST_MODEL_SIZE", "256"))
 BATCH_SIZE = int(os.environ.get("FEDCAST_BATCH_SIZE", "2"))
-if MODEL_SIZE != 288 or BATCH_SIZE != 2:
+if MODEL_SIZE != 256 or BATCH_SIZE != 2:
     logger.warning("PILOT overrides active: MODEL_SIZE=%d BATCH_SIZE=%d — "
                    "not valid for reproduction runs",
                    MODEL_SIZE, BATCH_SIZE)
@@ -56,6 +55,35 @@ def parse_client(spec):
     return {"name": name,
             "sequences": os.path.expanduser(seq),
             "manifest": os.path.expanduser(manifest)}
+
+
+# Shard value encoding (AUTHOR_FEEDBACK.md): valid precipitation capped at
+# VALUE_CAP mm/h and quantized in steps of VALUE_STEP, stored as uint16
+# counts of VALUE_STEP. float16 cannot hold k/32 exactly above 64 mm/h.
+# The dtype is the marker: decode_sequences scales uint16 and passes float
+# through (legacy float16 shards), so a shard never depends on its manifest
+# being readable to be decoded correctly.
+VALUE_CAP = 128.0
+VALUE_STEP = 1.0 / 32.0
+VALUE_ENCODING = {"dtype": "uint16", "scale": VALUE_STEP, "cap": VALUE_CAP}
+
+
+def encode_precip(rate):
+    """mm/h float -> uint16 counts of 1/32 mm/h; invalid/negative -> 0."""
+    rate = np.nan_to_num(np.asarray(rate, dtype=np.float32),
+                         nan=0.0, posinf=0.0, neginf=0.0)
+    rate = np.clip(rate, 0.0, VALUE_CAP)
+    return np.round(rate / VALUE_STEP).astype(np.uint16)
+
+
+def decode_sequences(raw):
+    """Shard values -> float32 mm/h, whatever encoding the shard uses."""
+    if raw.dtype == np.uint16:
+        return raw.astype(np.float32) * np.float32(VALUE_STEP)
+    if not np.issubdtype(raw.dtype, np.floating):
+        raise ValueError(f"unexpected shard dtype {raw.dtype}")
+    return np.nan_to_num(raw.astype(np.float32), nan=0.0, posinf=0.0,
+                         neginf=0.0)
 
 
 def interval_start_epoch(archive_start, archive_months, interval_months):
@@ -307,9 +335,10 @@ def load_client_data(client, t_start, limit=None):
     seqs, split = seqs[keep], split[keep]
 
     def to_tensor(mask):
-        arr = seqs[mask].astype(np.float32)
+        arr = seqs[mask]
         if limit:
             arr = arr[:limit]
+        arr = decode_sequences(arr)
         if arr.shape[0] == 0:
             return None, None
         arr = center_crop(arr)  # DGMR needs dims divisible by 32
