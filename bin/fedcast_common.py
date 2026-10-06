@@ -14,6 +14,42 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def _mirror_failures_to_stdout():
+    """Copy ERROR logs and uncaught tracebacks to stdout.
+
+    pegasus-kickstart's job record keeps only the first line of a job's
+    stderr once Lightning has written to it (seen on Unity, 2026-10-06), so
+    a traceback printed after that is lost and the job fails with nothing
+    but an exit code. Wrappers write nothing else to stdout, so anything
+    mirrored there survives intact in the record.
+    """
+    import traceback
+
+    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    root = logging.getLogger()
+    if not root.handlers:
+        # Some wrappers import this module before their own basicConfig
+        # call, which becomes a no-op once a handler exists. Set up the
+        # same stderr logging they would have, so nothing goes missing.
+        logging.basicConfig(level=logging.INFO, format=fmt)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.ERROR)
+    handler.setFormatter(logging.Formatter(fmt))
+    root.addHandler(handler)
+
+    previous = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        print("".join(traceback.format_exception(exc_type, exc, tb)),
+              file=sys.stdout, flush=True)
+        previous(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+
+_mirror_failures_to_stdout()
+
 INPUT_FRAMES = 4
 FORECAST_STEPS = 12
 GRID_LAMBDA = 20.0  # grid-cell regularizer weight (paper Sec. IV-C)
@@ -379,14 +415,22 @@ def fit_one_epoch(model, loader, epochs=1):
     """Run Lightning fit for a fixed number of epochs on one loader."""
     import pytorch_lightning as pl
     import torch
+    from pytorch_lightning.plugins.environments import LightningEnvironment
 
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
+        # Every job is one process on one device. Left to itself,
+        # Lightning sees SLURM_* variables in a batch job and switches to
+        # its Slurm cluster environment, which then refuses the job
+        # (Unity: Pegasus cores=2 arrive as --ntasks=2, "variable is not
+        # supported"). LightningEnvironment ignores the scheduler.
+        plugins=[LightningEnvironment()],
         logger=False,
         enable_checkpointing=False,
         enable_progress_bar=False,
+        enable_model_summary=False,
     )
     trainer.fit(model, loader)
 

@@ -189,6 +189,8 @@ class FedCastWorkflow:
         # sub-workflow outputs by path without knowing the site catalog's
         # local-site layout.
         self.local_storage_dir = os.path.abspath(args.output_dir)
+        # Set by set_container_binds() once the site's staging is known.
+        self.container_binds = []
 
         self.sites = args.sites
         # Cross-silo placement map (None = emulated placement, the paper's
@@ -315,6 +317,36 @@ class FedCastWorkflow:
     # ------------------------------------------------------------------
     # Transformation Catalog
     # ------------------------------------------------------------------
+    def set_container_binds(self, stages_on_compute):
+        """Host paths every container must see, beyond Apptainer's defaults.
+
+        pegasus.transfer.links makes PegasusLite symlink an input whenever
+        it already sits on the execution site's filesystem — with
+        --shared-filesystem (inputs read in place) and on any site that
+        stages through its own scratch (Unity: file:// scratch under the
+        workflow directory). The links point at absolute host paths, and
+        PegasusLite starts the container with --no-home and binds only the
+        job directory, so they dangle inside it: the job fails before the
+        wrapper starts, kickstart reporting "Unable to execute the
+        specified binary" (exit 127). Binding the workflow directory —
+        which holds bin/, the images, and the hosted catalogs' default
+        scratch — at its own path makes them resolve. Not on a condorio
+        pool: there inputs arrive as copies and the directory does not
+        exist on the workers, so a bind would fail every job.
+        """
+        binds = list(self.args.container_bind or [])
+        if stages_on_compute or self.args.shared_filesystem:
+            # The output directory too: FL rounds read the previous
+            # round's outputs from it, and it need not sit under wf_dir.
+            binds[:0] = [self.wf_dir] + (
+                [] if Path(self.local_storage_dir).is_relative_to(self.wf_dir)
+                else [self.local_storage_dir])
+        self.container_binds = list(dict.fromkeys(binds))
+        if self.container_binds:
+            logger.info("Containers bind %s (staged inputs are symlinks "
+                        "into these paths)",
+                        ", ".join(self.container_binds))
+
     def create_transformation_catalog(self):
         """Executables, containers and per-tool resource needs.
 
@@ -351,6 +383,8 @@ class FedCastWorkflow:
                 # exist (tools/silo_worker_setup.sh none). A home- or
                 # tmp-relative data_dir avoids all of this.
                 cargs.append(f"--bind {self.silos['data_dir']}")
+            for path in self.container_binds:
+                cargs.append(f"--bind {path}")
             if cargs:
                 containers[name].add_pegasus_profile(
                     container_arguments=" ".join(cargs))
@@ -1372,6 +1406,11 @@ your site catalog (hosted catalogs call it "compute") and adds
                              "with the same map first. Default: emulated "
                              "placement, as in the paper.")
 
+    parser.add_argument("--container-bind", metavar="DIR", action="append",
+                        help="Extra host directory to bind into every "
+                             "container (repeatable) — e.g. a site scratch "
+                             "directory outside the workflow directory, "
+                             "since staged inputs are symlinks into it")
     parser.add_argument("--shared-filesystem", action="store_true",
                         help="the workers can read the submit host's "
                              "filesystem, as on an HPC cluster with a "
@@ -1464,6 +1503,7 @@ your site catalog (hosted catalogs call it "compute") and adds
         workflow.log_placement()
         leaf_cleanup = check_site_catalog_setup(args, workflow.silos)
         workflow.create_pegasus_properties()
+        workflow.set_container_binds(leaf_cleanup)
         workflow.create_transformation_catalog()
         workflow.create_replica_catalog()
         workflow.write_subworkflow_conf()

@@ -165,6 +165,11 @@ place to run it.
 4. Did E2.1 and E2.2 train every date tag, or a subset?
 5. Were the 2 km / 5 min STEPS parameters intended for 1 km / 2-min MRMS input?
    (We match them as stated.)
+6. Event 20220307_2120 (21:20–21:40): the public MRMS archive has no
+   2022-03-07 21:24 PrecipRate file, and every 16-frame, 2-min-cadence sample
+   anchored on that window contains 21:24. Was its initialization outside the
+   window, or did benchmark construction tolerate a missing frame? (Found on
+   the first Unity pilot, 2026-10-06.)
 
 ## 4. Our working rules where the reply is silent
 
@@ -174,5 +179,10 @@ These are documented choices, revisable when the author answers.
   frame. With `ws` the window start, the 16 frames are `ws − 8 min .. ws + 22 min`
   at 2-min steps: inputs `ws − 8 .. ws − 2`, targets `ws .. ws + 22`. All 12
   window starts are on the even-minute grid already.
+- **Archive gaps in an event sample (Q6):** if the default sample has a gap,
+  the initialization slides in 2-min steps, nearest first, to the closest
+  complete sample whose targets still overlap the event window. The shift is
+  recorded per event (`init_shift_s` in `benchmark_sequences.npz`); for
+  20220307_2120 it is +14 min (frames 21:26–21:56).
 - **Event crop (Q2):** 256 × 256 on the 0.01° grid, centered on the centroid.
   Client sequences use the center 256 × 256 of each 300 × 300 site window.

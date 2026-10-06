@@ -9,7 +9,12 @@ postdate the study interval. Each event therefore gets its own MRMS fetch.
 
 Per event, one forecast initialization (AUTHOR_FEEDBACK.md Sec. 4, our rule
 for open question 1): the window start is the first target frame, so the 16
-frames run from start - 8 min to start + 22 min at 2-min steps. Each frame is
+frames run from start - 8 min to start + 22 min at 2-min steps. If the
+archive has a gap in that sample, the start slides in 2-min steps, nearest
+first, to the closest complete sample whose target frames still overlap the
+event window; the shift is recorded per event (`init_shift_s`). This is
+needed in practice: MRMS has no 2022-03-07 21:24 file, and every sample
+anchored on that event's window contains it (AUTHOR_FEEDBACK.md Q6). Each frame is
 cropped to MODEL_SIZE x MODEL_SIZE on the 0.01 degree grid, centered on the
 event centroid, and encoded exactly like the client shards (capped,
 quantized), so DGMR and STEPS see the same value domain they do in training.
@@ -20,7 +25,7 @@ as in the paper) and the job exits non-zero unless --allow-missing is given,
 because a reproduction must evaluate on all 12 events.
 
 Output npz: sequences (N, 16, S, S) encoded like the shards, event_id,
-selection, start_epoch (first frame), lat, lon.
+selection, start_epoch (first frame), init_shift_s, lat, lon.
 """
 
 import argparse
@@ -52,6 +57,7 @@ INPUT_FRAMES = 4
 SEQ_LEN = 16
 CADENCE_S = 120
 KEY_TOLERANCE_S = 59    # a key within a minute of the nominal time matches
+MAX_SHIFT_S = 30 * 60   # how far the init may slide to avoid an archive gap
 
 MAX_RETRIES = 5
 BACKOFF_BASE_S = 5
@@ -139,6 +145,31 @@ class DayIndex:
         return found[best]
 
 
+def find_sample(index, ev):
+    """(t_first, shift_s, keys) of the nearest complete 16-frame sample.
+
+    Candidates are the default anchoring shifted by multiples of the
+    cadence, nearest first (later before earlier on ties), kept only while
+    the target frames overlap the event window. Key lookups are listings,
+    so trying a candidate costs no downloads.
+    """
+    ws, we = parse_utc(ev["start_utc"]), parse_utc(ev["end_utc"])
+    base = ws - INPUT_FRAMES * CADENCE_S
+    steps = range(0, MAX_SHIFT_S // CADENCE_S + 1)
+    for shift in (d * sign * CADENCE_S for d in steps for sign in (1, -1)
+                  if d or sign == 1):
+        t_first = base + shift
+        t_target0 = t_first + INPUT_FRAMES * CADENCE_S
+        t_target1 = t_first + (SEQ_LEN - 1) * CADENCE_S
+        if t_target1 < ws or t_target0 > we:
+            continue
+        keys = [index.find(ev["domain"], t_first + k * CADENCE_S)
+                for k in range(SEQ_LEN)]
+        if all(keys):
+            return t_first, shift, keys
+    raise LookupError("no complete 16-frame sample overlaps the window")
+
+
 def fetch_frame(s3, key, ev, size):
     with tempfile.TemporaryDirectory() as tmp:
         gz_path = os.path.join(tmp, "frame.grib2.gz")
@@ -176,16 +207,19 @@ def main():
                                           retries={"max_attempts": 0}))
     index = DayIndex(s3)
 
-    seqs, ids, selections, starts, lats, lons = [], [], [], [], [], []
+    seqs, ids, selections, starts, shifts, lats, lons = ([] for _ in
+                                                         range(7))
     missing = []
     for ev in events:
-        t_first = parse_utc(ev["start_utc"]) - INPUT_FRAMES * CADENCE_S
         frames = []
         try:
-            for k in range(SEQ_LEN):
-                key = index.find(ev["domain"], t_first + k * CADENCE_S)
-                if key is None:
-                    raise LookupError(f"no key near frame {k}")
+            t_first, shift, keys = find_sample(index, ev)
+            if shift:
+                logger.warning("%s: default sample has an archive gap; "
+                               "init shifted %+d min to the nearest "
+                               "complete sample", ev["event_id"],
+                               shift // 60)
+            for key in keys:
                 window = fetch_frame(s3, key, ev, args.crop_size)
                 if window is None:
                     raise LookupError("crop leaves the domain")
@@ -199,6 +233,7 @@ def main():
         ids.append(ev["event_id"])
         selections.append(ev.get("selection", ""))
         starts.append(t_first)
+        shifts.append(shift)
         lats.append(ev["lat"])
         lons.append(ev["lon"])
         logger.info("%s: 16 frames from %s", ev["event_id"],
@@ -214,6 +249,7 @@ def main():
         event_id=np.array(ids, dtype=str),
         selection=np.array(selections, dtype=str),
         start_epoch=np.array(starts, dtype=np.float64),
+        init_shift_s=np.array(shifts, dtype=np.int64),
         lat=np.array(lats), lon=np.array(lons),
     )
     logger.info("Wrote %d/%d event samples -> %s", len(seqs), len(events),

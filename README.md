@@ -561,6 +561,9 @@ a long run.
 
 ## Running on another cluster
 
+For Unity (UMass, MGHPCC) there is a tested step-by-step guide:
+[UNITY.md](UNITY.md).
+
 Nothing in the repository hard-codes a host, a path or a scheduler:
 catalogs, properties, and the FL-round sub-workflow YAMLs are all generated
 from the directory the generator runs in, and they are gitignored. To run
