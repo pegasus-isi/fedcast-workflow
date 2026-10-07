@@ -107,13 +107,17 @@ BENCHMARK_EVENTS_LFN = "benchmark_events.csv"
 # outrank site-catalog ones, so a tag cannot shrink them — what a tag does
 # is say how the request is expressed on the pool (partition, constraint).
 TOOL_CONFIGS = {
+    # A full-cadence month is ~21,600 frames at ~1.4 s each (download +
+    # decode, measured on Unity 2026-10-07): ~8.3 h, so 16 h leaves room.
     "fetch_crop_mrms":      {"memory": "4 GB",  "cores": 1, "container": "data",
-                             "runtime": 6 * 3600},
+                             "runtime": 16 * 3600},
     "preprocess_sequences": {"memory": "16 GB", "cores": 4, "container": "data",
                              "runtime": 4 * 3600},
     "fetch_benchmark":      {"memory": "4 GB",  "cores": 1, "container": "data",
                              "runtime": 2 * 3600},
-    "train_dgmr":           {"memory": "32 GB", "cores": 8, "container": "train",
+    # Centralized training holds every client's shard for the window:
+    # at L=48 ~14 GB raw plus ~20 GB decoded, past 32 GB.
+    "train_dgmr":           {"memory": "64 GB", "cores": 8, "container": "train",
                              "gpus": 1, "runtime": 12 * 3600},
     "fl_init":              {"memory": "8 GB",  "cores": 2, "container": "train",
                              "runtime": 1800},
