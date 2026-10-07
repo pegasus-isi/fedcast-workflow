@@ -354,6 +354,14 @@ class FedCastWorkflow:
 
     def create_pegasus_properties(self):
         self.props = self.base_properties()
+        # Parent only. Data reuse is what prunes the FL rounds: their
+        # outputs are not staged out by the parent, so the planner
+        # treats every round as unneeded (run0002 planned with no
+        # federated arm). Nothing here registers replicas, so reuse has
+        # nothing to reuse anyway; turning it off keeps the chain without
+        # the parent staging any round output (see _add_federated_
+        # subworkflows for why it must not).
+        self.props["pegasus.data.reuse.scope"] = "none"
 
     # ------------------------------------------------------------------
     # Transformation Catalog
@@ -941,14 +949,17 @@ class FedCastWorkflow:
                 prev_history = names["history_out"]
                 prev_best = names["best_out"]
             if is_final:
-                # This one stays stage_out=True, and is the reason the FL
-                # chain survives planning at all: it is the only output of
-                # the last round that anything downstream requires, so
-                # with it false the planner prunes every round
-                # sub-workflow (run0002 planned with no federated arm).
-                # collect_file reads the staged copy from the output
-                # directory by path.
-                subwf.add_outputs(File(sub_best_lfn), stage_out=True,
+                # stage_out=False: the round publishes this file to the
+                # output directory itself, and collect_file reads it there
+                # by path. A parent stage-out would instead pass the round
+                # an --output-map asking for a copy in parent scratch,
+                # and the Pegasus 6.0.0.dev0 planner honors that map for
+                # some LFNs and silently drops it for others (decided by
+                # the name: fed_L1_202401_best_sub.ckpt kept, ..._202404_
+                # dropped), so the parent's stage-out then fails on a
+                # missing source (run0007). The chain is kept from being
+                # pruned by pegasus.data.reuse.scope=none instead.
+                subwf.add_outputs(File(sub_best_lfn), stage_out=False,
                                   register_replica=False)
             self.wf.add_jobs(subwf)
             if self.silos and r == 0:
