@@ -52,6 +52,22 @@ def load_state(path):
     return model_state, best_state, history
 
 
+def fail_with_outputs(args, reason):
+    """Write every declared output as an error stub, then exit 1.
+
+    A missing declared output makes HTCondor hold the job on stage-out
+    instead of failing it, so the final segment's --best-out is written
+    too. The stubs carry the reason and no weights.
+    """
+    import torch
+
+    save_state(args.state_out, {}, {}, {"error": reason})
+    if args.best_out:
+        torch.save({"state_dict": {}, "history": {"error": reason}},
+                   args.best_out)
+    sys.exit(1)
+
+
 def save_state(path, model_state, best_state, history):
     import torch
 
@@ -113,8 +129,7 @@ def main():
     if not data:
         logger.error("No training data in the L=%d window ending %s",
                      args.interval_months, args.window_end)
-        save_state(args.state_out, {}, {}, {"error": "no data"})
-        sys.exit(1)
+        fail_with_outputs(args, "no data")
     if all(d["val"][0] is None for d in data):
         # Without validation data every checkpoint scores inf and the
         # "best" one is just the first validated: model selection would
@@ -122,8 +137,7 @@ def main():
         logger.error("No validation sequences in the L=%d window ending "
                      "%s at any client: cannot select a best checkpoint",
                      args.interval_months, args.window_end)
-        save_state(args.state_out, {}, {}, {"error": "no validation data"})
-        sys.exit(1)
+        fail_with_outputs(args, "no validation data")
 
     model = fc.build_model(args.seed)
     if args.state_in:
