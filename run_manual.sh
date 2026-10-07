@@ -31,7 +31,7 @@ fi
 
 cd "$WORK"
 BIN=$ROOT/bin
-MONTH="2024-01"
+MONTH="2024-04"
 SITES_CONUS="KTLX:35.3331:-97.2778:KTLX_${MONTH}_cropped.nc \
 KENX:42.5865:-74.0639:KENX_${MONTH}_cropped.nc"
 

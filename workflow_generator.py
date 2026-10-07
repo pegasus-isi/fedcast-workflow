@@ -1527,7 +1527,11 @@ your site catalog (hosted catalogs call it "compute") and adds
 
     if args.test:
         args.sites = ["KTLX", "KENX"]
-        args.start_month = "2024-01"
+        # The validation split mirrors the test split (the first three
+        # days of the month), so the pilot month must be wet early at
+        # both sites or validation never runs. 2024-01 was dry on
+        # days 1-3 at KTLX and KENX; April 2024 is not.
+        args.start_month = "2024-04"
         args.months = 1
         args.intervals = [1]
         # The paper's L=1 tags are outside the one-month pilot archive.

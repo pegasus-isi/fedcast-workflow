@@ -115,6 +115,15 @@ def main():
                      args.interval_months, args.window_end)
         save_state(args.state_out, {}, {}, {"error": "no data"})
         sys.exit(1)
+    if all(d["val"][0] is None for d in data):
+        # Without validation data every checkpoint scores inf and the
+        # "best" one is just the first validated: model selection would
+        # silently not happen.
+        logger.error("No validation sequences in the L=%d window ending "
+                     "%s at any client: cannot select a best checkpoint",
+                     args.interval_months, args.window_end)
+        save_state(args.state_out, {}, {}, {"error": "no validation data"})
+        sys.exit(1)
 
     model = fc.build_model(args.seed)
     if args.state_in:

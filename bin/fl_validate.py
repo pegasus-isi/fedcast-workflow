@@ -25,6 +25,7 @@ Two data paths, same number:
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 
@@ -128,6 +129,16 @@ def main():
         logger.info("Final best checkpoint (unit %d, val %s) -> %s",
                     history["best_unit"], history["best_val"],
                     args.final_best)
+
+    if not math.isfinite(val):
+        # Outputs are written first so the job fails instead of holding.
+        # An infinite loss means no client had validation sequences in
+        # this window, so the best checkpoint would be chosen blind.
+        logger.error("Validation loss is %s: no client has validation "
+                     "sequences in the L=%d window ending %s, so a best "
+                     "checkpoint cannot be selected", val,
+                     args.interval_months, args.window_end)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
