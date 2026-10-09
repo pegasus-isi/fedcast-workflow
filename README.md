@@ -120,7 +120,8 @@ requirements, `--nodelist` — lives in the site catalog, keyed by tag, which
 is what makes the same `workflow.yml` plan on an HTCondor pool and on Unity.
 
 **With a hosted catalog.** Pegasus downloads the catalog named by
-`pegasus.catalog.site.repo.file` in `~/.pegasusrc` from
+`pegasus.catalog.site.repo.file` — set per workflow with
+`workflow_generator.py -s unity.yml`, or once per host in `~/.pegasusrc` — from
 [pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf)
 and merges a local `sites.yml`, if present, over it — local entries win key
 by key, and `x-tags` merge the same way. `unity.yml`, for instance, already
@@ -578,7 +579,8 @@ this somewhere else:
    venv).
 2. Build the three Apptainer images (Quick start step 1). They are large
    and not in git.
-3. Point `~/.pegasusrc` at the cluster's hosted site catalog, or write a
+3. Name the cluster's hosted site catalog (`workflow_generator.py -s
+   <catalog>.yml`, or `~/.pegasusrc`), or write a
    complete one with `custom_sites.py --full`; add your account and any
    GPU constraint with `custom_sites.py` either way ([Sites](#sites)).
 4. Run `workflow_generator.py`, which writes `transformations.yml`,
@@ -598,7 +600,7 @@ this somewhere else:
 
 The sub-workflow properties repeat everything in `pegasus.properties`
 (worker-package settings for containers whose OS differs from the submit
-host, the hosted-catalog selection from `~/.pegasusrc`, the path to a
+host, the hosted-catalog selection from `-s` or `~/.pegasusrc`, the path to a
 local `sites.yml`) because FL rounds are planned with their own
 configuration file, not the parent's. Re-run the generator after changing
 `~/.pegasusrc` or writing a new `sites.yml`.

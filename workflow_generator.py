@@ -316,6 +316,11 @@ class FedCastWorkflow:
         """
         rc = Path.home() / ".pegasusrc"
         props = Properties.load(rc) if rc.is_file() else Properties()
+        if self.args.hosted_site_catalog:
+            # -s names the hosted catalog for this workflow, overriding any
+            # in ~/.pegasusrc; the planner downloads and caches it.
+            props["pegasus.catalog.site.repo.file"] = (
+                self.args.hosted_site_catalog)
         props["pegasus.transfer.threads"] = "16"
         # Jobs run inside containers whose OS differs from the submit
         # host (Debian 13 / Ubuntu 22 vs Ubuntu 24). Use the staged
@@ -1205,7 +1210,7 @@ def cleanup_strategy(args, base_catalog, hosted):
             f"through their own scratch")
     elif hosted:
         stages_on_compute, why = True, (
-            f"the hosted catalog {hosted} is named in ~/.pegasusrc but is "
+            f"the hosted catalog {hosted} is configured but is "
             f"not in this directory yet, so its data configuration cannot "
             f"be read. Hosted catalogs are batch sites; leaf cleanup is "
             f"assumed because it plans on either kind of site, while "
@@ -1233,9 +1238,9 @@ def check_site_catalog_setup(args, silos):
     """Report where the site catalog comes from; abort if it cannot pin.
 
     The generator writes no site catalog. Planning needs either a hosted
-    one (pegasus.catalog.site.repo.file in ~/.pegasusrc) or a local
-    sites.yml, and that is a warning either way — pegasus-plan fails
-    plainly when neither exists.
+    one (named with -s, or pegasus.catalog.site.repo.file in ~/.pegasusrc)
+    or a local sites.yml, and that is a warning either way — pegasus-plan
+    fails plainly when neither exists.
 
     Cross-silo runs are different and abort here, because none of their
     failure modes fail planning. A pinned job carries a tag and nothing
@@ -1246,18 +1251,20 @@ def check_site_catalog_setup(args, silos):
     loses every later round's shard while still calling itself
     cross-silo. Not being able to *tell* is refused for the same reason.
     """
-    hosted, discovered = hosted_catalog()
+    hosted, discovered = hosted_catalog(name=args.hosted_site_catalog)
     hosted_copy = args.base_catalog or discovered
     local = os.path.isfile(args.sites_yml)
     if hosted:
-        logger.info(f"Site catalog: hosted {hosted} (~/.pegasusrc)"
+        source = "-s" if args.hosted_site_catalog else "~/.pegasusrc"
+        logger.info(f"Site catalog: hosted {hosted} ({source})"
                     + (f" + {args.sites_yml} overlay" if local else ""))
     elif local:
         logger.info(f"Site catalog: {args.sites_yml}")
     else:
         logger.warning(
-            "No site catalog: set pegasus.catalog.site.repo.file in "
-            "~/.pegasusrc (hosted catalog, e.g. unity.yml) or write "
+            "No site catalog: name a hosted catalog with -s (e.g. "
+            "-s unity.yml) or in ~/.pegasusrc "
+            "(pegasus.catalog.site.repo.file), or write "
             f"{args.sites_yml} with custom_sites.py --full before planning")
 
     # Answered before any early return below, because it applies to every
@@ -1368,6 +1375,12 @@ your site catalog (hosted catalogs call it "compute") and adds
                              "pegasus-plan command (default: compute, the "
                              "hosted site catalogs' convention). The "
                              "workflow itself does not depend on it.")
+    parser.add_argument("-s", "--hosted-site-catalog", metavar="FILE",
+                        help="Centrally hosted site catalog to plan against, "
+                             "e.g. unity.yml (github.com/pegasushub/"
+                             "pegasus-site-catalogs); written to the parent "
+                             "and FL-round sub-workflow properties. Default: "
+                             "the one named in ~/.pegasusrc, if any.")
     parser.add_argument("-o", "--output", metavar="STR", type=str,
                         default="workflow.yml",
                         help="Output file (default: workflow.yml)")

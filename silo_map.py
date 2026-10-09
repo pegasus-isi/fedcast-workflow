@@ -400,23 +400,25 @@ def read_site_style(profiles):
     return None
 
 
-def hosted_catalog(pegasusrc=None, cwd=None):
+def hosted_catalog(pegasusrc=None, cwd=None, name=None):
     """The hosted site catalog in use: (name, local copy path or None).
 
+    `name` is the one the workflow names itself (the generator's
+    -s/--hosted-site-catalog) and wins; otherwise the one in ~/.pegasusrc.
     The planner downloads the file named by pegasus.catalog.site.repo.file
     into the directory it runs in, so once a workflow has been planned
     there is a local copy to read the site's real submission style from.
     Returns (None, None) when no hosted catalog is configured.
     """
-    rc = Path(pegasusrc) if pegasusrc else Path.home() / ".pegasusrc"
-    name = None
-    try:
-        for line in rc.read_text().splitlines():
-            key, sep, value = line.partition("=")
-            if sep and key.strip() == "pegasus.catalog.site.repo.file":
-                name = value.strip()
-    except OSError:
-        return None, None
+    if not name:
+        rc = Path(pegasusrc) if pegasusrc else Path.home() / ".pegasusrc"
+        try:
+            for line in rc.read_text().splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key.strip() == "pegasus.catalog.site.repo.file":
+                    name = value.strip()
+        except OSError:
+            return None, None
     if not name:
         return None, None
     path = Path(cwd or ".") / name
