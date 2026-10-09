@@ -65,11 +65,11 @@ EOF
 
 # 3. Pilot run (2 sites, 1 month, 2 rounds — end-to-end smoke test)
 python3 workflow_generator.py --test
-pegasus-plan --submit -s compute --output-dir output workflow.yml
+pegasus-plan --dir submit --submit -s compute --output-dir output workflow.yml
 
 # 4. Full E1 reproduction
 python3 workflow_generator.py --start-month 2020-11 --months 48
-pegasus-plan --submit -s compute --output-dir output workflow.yml
+pegasus-plan --dir submit --submit -s compute --output-dir output workflow.yml
 
 # 5. With ablations
 python3 workflow_generator.py --start-month 2020-11 --months 48 \
@@ -77,7 +77,17 @@ python3 workflow_generator.py --start-month 2020-11 --months 48 \
 ```
 
 `compute` is the execution site's name in every hosted catalog; the
-generator prints the exact `pegasus-plan` line for your `--output-dir`.
+generator writes the workflow and catalogs, **does not submit**, and prints
+the exact `pegasus-plan` line for your `--output-dir`. Name a hosted catalog
+per workflow with `-s unity.yml` instead of `~/.pegasusrc`; on a plain
+HTCondor pool with no site catalog, generate with `-e condorpool` (Pegasus
+defines that site itself) and plan with `-s condorpool`.
+
+The notebook `FedCast-Workflow.ipynb` runs the pilot interactively with the
+same generator class (`build_parser()`, `finalize_args()`, `FedCastWorkflow`)
+— builds the images, generates, draws the DAG, then plans and submits from an
+explicit cell. Its `create_sites_catalog()` writes a local HTCondor `compute`
+site for notebook use only; the CLI never writes the execution site.
 
 Or run the wrappers directly without Pegasus/HTCondor:
 
@@ -196,7 +206,7 @@ Plan such a site with `--cleanup leaf`, which the generator adds to the
 `pegasus-plan` command it prints whenever the site might stage on itself:
 
 ```sh
-pegasus-plan --submit -s compute --cleanup leaf --output-dir output workflow.yml
+pegasus-plan --dir submit --submit -s compute --cleanup leaf --output-dir output workflow.yml
 ```
 
 Leaf cleanup still removes the site's scratch directory at the end of the
@@ -377,7 +387,7 @@ curl -O https://raw.githubusercontent.com/pegasushub/pegasus-site-catalogs/main/
 tools/silo_check.py --style slurm silos.yml     # confirm the cluster matches
 python3 workflow_generator.py --start-month 2020-11 --months 48 \
     --silos silos.yml --base-catalog unity.yml
-pegasus-plan --submit -s compute --output-dir output workflow.yml
+pegasus-plan --dir submit --submit -s compute --output-dir output workflow.yml
 ```
 
 (`--style condor` throughout on an HTCondor pool; drop `--base` if you have
