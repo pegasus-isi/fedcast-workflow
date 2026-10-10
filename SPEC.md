@@ -127,6 +127,7 @@ fedcast-workflow/
 │   ├── silo_worker_setup.sh   # HTCondor worker prep, non-default maps only
 │   └── timing_extrapolate.py  # project full-study wall-clock from a run dir
 ├── Apptainer/                 # FedCast_{data,train,eval}.def
+├── FedCast-Workflow.ipynb     # notebook: pilot run via the generator class
 ├── run_manual.sh              # tiny end-to-end smoke test without Pegasus
 ├── requirements.txt           # submit-host only; job deps live in the images
 ├── SPEC.md                    # this file

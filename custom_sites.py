@@ -186,6 +186,11 @@ def main():
                              "x-tag (the hosted file pegasus-plan downloads "
                              "into the working directory). Needed so silo "
                              "GPU tags carry the site's full GPU settings.")
+    parser.add_argument("--hosted-site-catalog", metavar="FILE",
+                        help="hosted catalog this overlays, e.g. unity.yml "
+                             "(default: the one named in ~/.pegasusrc, if "
+                             "any); its downloaded copy is checked against "
+                             "--style")
     parser.add_argument("--silos", metavar="YAML",
                         help="cross-silo map (see silos.example.yml): write "
                              "a CPU and a GPU tag per client that pin its "
@@ -203,7 +208,8 @@ def main():
     # A --style that contradicts the catalog being overlaid is the one
     # mistake nothing downstream can catch on its own, so check it here
     # against whatever catalog is at hand.
-    reference = args.base or hosted_catalog()[1]
+    reference = args.base or hosted_catalog(
+        name=args.hosted_site_catalog)[1]
     if reference:
         check_style_against(reference, args.site, args.style, parser)
 

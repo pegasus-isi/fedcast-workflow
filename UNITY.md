@@ -115,7 +115,7 @@ python workflow_generator.py --test --shared-filesystem
 # Full E1 reproduction
 # python workflow_generator.py --start-month 2020-11 --months 48 --shared-filesystem
 
-pegasus-plan --submit -s compute --cleanup leaf --output-dir output workflow.yml
+pegasus-plan --dir submit --submit -s compute --cleanup leaf --output-dir output workflow.yml
 ```
 
 Use the `pegasus-plan` line the generator prints. On Unity it always

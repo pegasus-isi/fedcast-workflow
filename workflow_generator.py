@@ -22,14 +22,18 @@ states only what it needs — cores, memory, GPUs, runtime — and GPU jobs
 carry the Pegasus tag "gpu" (pinned silo jobs carry "silo_<SITE>" or
 "silo_<SITE>_gpu"). Where those jobs run, and what a tag means there
 (partition, account, constraints, --nodelist, ClassAd requirements), comes
-from the site catalog: a hosted one selected in ~/.pegasusrc
-(pegasus.catalog.site.repo.file), optionally overlaid by a local sites.yml
-written by custom_sites.py. Needs Pegasus >= 5.1.3dev / 6.0.0dev for tags.
+from the site catalog: a hosted one named with -s/--hosted-site-catalog or
+in ~/.pegasusrc (pegasus.catalog.site.repo.file), optionally overlaid by a
+local sites.yml written by custom_sites.py. Needs Pegasus >= 5.1.3dev /
+6.0.0dev for tags. The generator writes no site catalog and does not submit:
+it prints the pegasus-plan command (FedCast-Workflow.ipynb drives the same
+class and submits from an explicit cell; its create_sites_catalog() writes a
+local HTCondor catalog for notebook use only).
 
 Usage:
     # Pilot (2 sites, 1 month, tiny training budget):
-    ./workflow_generator.py --test
-    pegasus-plan --submit -s compute --output-dir output workflow.yml
+    ./workflow_generator.py --test -s unity.yml
+    pegasus-plan --dir submit --submit -s compute --output-dir output workflow.yml
 
     # Full E1 reproduction (7 sites, 48 months, 100 rounds/epochs):
     ./workflow_generator.py --start-month 2020-11 --months 48
@@ -213,6 +217,7 @@ class FedCastWorkflow:
     """Fed-Cast reproduction workflow (see SPEC.md)."""
 
     wf = None
+    sc = None
     tc = None
     rc = None
     props = None
@@ -304,6 +309,85 @@ class FedCastWorkflow:
         self.wf.write(file=self.dagfile)
 
     # ------------------------------------------------------------------
+    # Plan / run / monitor (thin wrappers over the Pegasus API Workflow
+    # object, for interactive use e.g. from a Jupyter notebook)
+    # ------------------------------------------------------------------
+    def plan_submit(self, exec_site_name="compute", cleanup="none",
+                    raise_errors=False):
+        """Plan and submit. cleanup="leaf" where check_site_catalog_setup()
+        says the site stages on compute (the CLI prints the same choice)."""
+        try:
+            self.wf.plan(
+                dir="submit",
+                sites=[exec_site_name],
+                output_sites=["local"],
+                output_dir=self.local_storage_dir,
+                cleanup=cleanup,
+                verbose=1,
+                submit=True,
+            )
+        except PegasusClientError as e:
+            print(e)
+            if raise_errors:
+                raise
+
+    def status(self):
+        try:
+            self.wf.status(long=True)
+        except PegasusClientError as e:
+            print(e)
+
+    def wait(self):
+        try:
+            self.wf.wait()
+        except PegasusClientError as e:
+            print(e)
+
+    def statistics(self):
+        try:
+            self.wf.statistics()
+        except PegasusClientError as e:
+            print(e)
+
+    # ------------------------------------------------------------------
+    # Site Catalog
+    #
+    # Not used by the CLI — pegasus-plan resolves the site catalog from a
+    # centrally hosted one (-s/--hosted-site-catalog or ~/.pegasusrc), with
+    # an optional sites.yml overlay from custom_sites.py. Kept for
+    # notebook use when a self-contained, locally generated HTCondor site
+    # catalog is wanted. Written immediately (to --sites-yml) because the
+    # site-catalog checks and the FL-round sub-workflow properties read it
+    # before write(). GPU jobs carry the "gpu" tag; a plain pool runs them
+    # wherever HTCondor matches them (custom_sites.py --style condor --gpu
+    # pins them to GPU slots).
+    # ------------------------------------------------------------------
+    def create_sites_catalog(self, exec_site_name="compute"):
+        self.sc = SiteCatalog()
+
+        scratch = os.path.join(self.wf_dir, "scratch")
+        local = Site("local").add_directories(
+            Directory(Directory.SHARED_SCRATCH, scratch).add_file_servers(
+                FileServer("file://" + scratch, Operation.ALL)
+            ),
+            Directory(
+                Directory.LOCAL_STORAGE, self.local_storage_dir
+            ).add_file_servers(
+                FileServer("file://" + self.local_storage_dir, Operation.ALL)
+            ),
+        )
+
+        exec_site = (
+            Site(exec_site_name)
+            .add_condor_profile(universe="vanilla")
+            .add_pegasus_profile(style="condor")
+        )
+
+        self.sc.add_sites(local, exec_site)
+        self.sc.write(self.args.sites_yml)
+        self.local_sites_yml = os.path.abspath(self.args.sites_yml)
+
+    # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
     def base_properties(self):
@@ -316,6 +400,11 @@ class FedCastWorkflow:
         """
         rc = Path.home() / ".pegasusrc"
         props = Properties.load(rc) if rc.is_file() else Properties()
+        if self.args.hosted_site_catalog:
+            # -s names the hosted catalog for this workflow, overriding any
+            # in ~/.pegasusrc; the planner downloads and caches it.
+            props["pegasus.catalog.site.repo.file"] = (
+                self.args.hosted_site_catalog)
         props["pegasus.transfer.threads"] = "16"
         # Jobs run inside containers whose OS differs from the submit
         # host (Debian 13 / Ubuntu 22 vs Ubuntu 24). Use the staged
@@ -1205,7 +1294,7 @@ def cleanup_strategy(args, base_catalog, hosted):
             f"through their own scratch")
     elif hosted:
         stages_on_compute, why = True, (
-            f"the hosted catalog {hosted} is named in ~/.pegasusrc but is "
+            f"the hosted catalog {hosted} is configured but is "
             f"not in this directory yet, so its data configuration cannot "
             f"be read. Hosted catalogs are batch sites; leaf cleanup is "
             f"assumed because it plans on either kind of site, while "
@@ -1233,9 +1322,9 @@ def check_site_catalog_setup(args, silos):
     """Report where the site catalog comes from; abort if it cannot pin.
 
     The generator writes no site catalog. Planning needs either a hosted
-    one (pegasus.catalog.site.repo.file in ~/.pegasusrc) or a local
-    sites.yml, and that is a warning either way — pegasus-plan fails
-    plainly when neither exists.
+    one (named with -s, or pegasus.catalog.site.repo.file in ~/.pegasusrc)
+    or a local sites.yml, and that is a warning either way — pegasus-plan
+    fails plainly when neither exists.
 
     Cross-silo runs are different and abort here, because none of their
     failure modes fail planning. A pinned job carries a tag and nothing
@@ -1246,18 +1335,20 @@ def check_site_catalog_setup(args, silos):
     loses every later round's shard while still calling itself
     cross-silo. Not being able to *tell* is refused for the same reason.
     """
-    hosted, discovered = hosted_catalog()
+    hosted, discovered = hosted_catalog(name=args.hosted_site_catalog)
     hosted_copy = args.base_catalog or discovered
     local = os.path.isfile(args.sites_yml)
     if hosted:
-        logger.info(f"Site catalog: hosted {hosted} (~/.pegasusrc)"
+        source = "-s" if args.hosted_site_catalog else "~/.pegasusrc"
+        logger.info(f"Site catalog: hosted {hosted} ({source})"
                     + (f" + {args.sites_yml} overlay" if local else ""))
     elif local:
         logger.info(f"Site catalog: {args.sites_yml}")
     else:
         logger.warning(
-            "No site catalog: set pegasus.catalog.site.repo.file in "
-            "~/.pegasusrc (hosted catalog, e.g. unity.yml) or write "
+            "No site catalog: name a hosted catalog with -s (e.g. "
+            "-s unity.yml) or in ~/.pegasusrc "
+            "(pegasus.catalog.site.repo.file), or write "
             f"{args.sites_yml} with custom_sites.py --full before planning")
 
     # Answered before any early return below, because it applies to every
@@ -1343,7 +1434,8 @@ def check_site_catalog_setup(args, silos):
 # ======================================================================
 # main()
 # ======================================================================
-def main():
+def build_parser():
+    """The CLI's argument parser (also used by the notebook)."""
     parser = argparse.ArgumentParser(
         description="Fed-Cast reproduction workflow generator (see SPEC.md)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1354,10 +1446,11 @@ Examples:
   %(prog)s --start-month 2020-11 --months 48 --experiments e1 e21 e22
   %(prog)s --start-month 2020-11 --months 48 --silos silos.yml
 
-Then plan with the command this prints; it names the execution site from
-your site catalog (hosted catalogs call it "compute") and adds
---cleanup leaf where the site stages through its own scratch:
-  pegasus-plan --submit -s compute --output-dir output workflow.yml
+Writes the workflow and catalogs; it does not plan or submit. Plan with the
+command this prints; it names the execution site from your site catalog
+(hosted catalogs call it "compute") and adds --cleanup leaf where the site
+stages through its own scratch:
+  pegasus-plan --dir submit --submit -s compute --output-dir output workflow.yml
 """,
     )
 
@@ -1368,6 +1461,12 @@ your site catalog (hosted catalogs call it "compute") and adds
                              "pegasus-plan command (default: compute, the "
                              "hosted site catalogs' convention). The "
                              "workflow itself does not depend on it.")
+    parser.add_argument("-s", "--hosted-site-catalog", metavar="FILE",
+                        help="Centrally hosted site catalog to plan against, "
+                             "e.g. unity.yml (github.com/pegasushub/"
+                             "pegasus-site-catalogs); written to the parent "
+                             "and FL-round sub-workflow properties. Default: "
+                             "the one named in ~/.pegasusrc, if any.")
     parser.add_argument("-o", "--output", metavar="STR", type=str,
                         default="workflow.yml",
                         help="Output file (default: workflow.yml)")
@@ -1538,8 +1637,14 @@ your site catalog (hosted catalogs call it "compute") and adds
                         help="Pilot mode: 2 sites, 1 month, 2 rounds, "
                              "interval [1] — end-to-end smoke test")
 
-    args = parser.parse_args()
+    return parser
 
+
+def finalize_args(args):
+    """Apply --test (pilot) settings and validate; exits on bad input.
+
+    Shared by the CLI and the notebook so both build the same workflow.
+    """
     if args.test:
         args.sites = ["KTLX", "KENX"]
         # The validation split mirrors the test split (the first three
@@ -1581,6 +1686,11 @@ your site catalog (hosted catalogs call it "compute") and adds
     if "e22" in args.experiments and not args.sam_rho:
         print("Error: --experiments e22 requires at least one --sam-rho")
         sys.exit(1)
+    return args
+
+
+def main():
+    args = finalize_args(build_parser().parse_args())
 
     logger.info("=" * 70)
     logger.info("FED-CAST WORKFLOW GENERATOR")
@@ -1628,7 +1738,8 @@ your site catalog (hosted catalogs call it "compute") and adds
         workflow.write()
 
         logger.info(f"\nWorkflow written to {args.output}")
-        logger.info(f"Submit: pegasus-plan --submit "
+        logger.info(f"Plan and submit (this generator does not submit): "
+                    f"pegasus-plan --dir submit --submit "
                     f"-s {args.execution_site_name} "
                     + ("--cleanup leaf " if leaf_cleanup else "")
                     + f"--output-dir {workflow.local_storage_dir} "
